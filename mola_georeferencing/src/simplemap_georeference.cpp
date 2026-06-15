@@ -35,6 +35,7 @@
 #include <mola_gtsam_factors/imu_helpers.h>
 
 #include <algorithm>
+#include <iomanip>
 #include <limits>
 
 mola::SMGeoReferencingOutput mola::simplemap_georeference(
