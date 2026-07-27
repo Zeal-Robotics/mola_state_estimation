@@ -75,6 +75,10 @@ constexpr double PLANAR_XY_SIGMA             = 1e10;
 constexpr double PLANAR_Z_SIGMA              = 1e-4;
 constexpr double TRICYCLE_LARGE_SIGMAS       = 1e6;
 
+/// Huber threshold [whitened units] for raw gyro observations; the standard
+/// value giving ~95% efficiency under Gaussian noise.
+constexpr double GYRO_HUBER_K = 1.345;
+
 void enforce_planar_pose(mrpt::poses::CPose3D& p)
 {
     p.z(0);
@@ -687,7 +691,10 @@ void StateEstimationSmoother::fuse_imu_locked(const mrpt::obs::CObservationIMU& 
     const bool hasAttitude = imu.has(mrpt::obs::IMU_ORI_QUAT_W);
     const bool hasGravity =
         imu.has(mrpt::obs::IMU_X_ACC) && params_.imu_normalized_gravity_alignment_sigma > 0;
-    if (!hasAttitude && !hasGravity)
+    const bool hasAngularVelocity = imu.has(mrpt::obs::IMU_WX) && imu.has(mrpt::obs::IMU_WY) &&
+                                    imu.has(mrpt::obs::IMU_WZ) &&
+                                    params_.imu_angular_velocity_sigma > 0;
+    if (!hasAttitude && !hasGravity && !hasAngularVelocity)
     {
         return;
     }
@@ -715,6 +722,9 @@ void StateEstimationSmoother::fuse_imu_locked(const mrpt::obs::CObservationIMU& 
         "[fuse_imu]: t=%f  this_kf_id=%zu ", mrpt::Clock::toDouble(imu.timestamp),
         static_cast<size_t>(this_kf_id));
 
+    // Shared by every branch below (at least one runs, given the early return above):
+    const auto sensorOnVehicle = mrpt::gtsam_wrappers::toPose3(imu.sensorPose);
+
     // Direct azimuth observation?
     // -------------------------------------------------
     if (imu.has(mrpt::obs::IMU_ORI_QUAT_W))
@@ -727,15 +737,13 @@ void StateEstimationSmoother::fuse_imu_locked(const mrpt::obs::CObservationIMU& 
         if (!mola::factors::imu_quaternion_looks_valid(qw, qx, qy, qz))
         {
             MRPT_LOG_THROTTLE_WARN(
-                5.0, "Ignoring invalid (NaN or non-normalized) IMU orientation quaternion");
+                60.0, "Ignoring invalid (NaN or non-normalized) IMU orientation quaternion");
         }
         else
         {
             // GTSAM uses w,x,y,z quaternion order:
             const auto measuredRotation = mola::factors::imu_apply_enu_azimuth_correction(
                 gtsam::Rot3::Quaternion(qw, qx, qy, qz), params_.imu_attitude_azimuth_offset_deg);
-
-            const auto sensorOnVehicle = mrpt::gtsam_wrappers::toPose3(imu.sensorPose);
 
             // Create noise model for rotation (3 DOF: roll, pitch, yaw)
             auto rotationNoise = gtsam::noiseModel::Isotropic::Sigma(
@@ -762,8 +770,6 @@ void StateEstimationSmoother::fuse_imu_locked(const mrpt::obs::CObservationIMU& 
         {
             const gtsam::Vector3 measuredGravityNormalized = measuredGravity.normalized();
 
-            const auto sensorOnVehicle = mrpt::gtsam_wrappers::toPose3(imu.sensorPose);
-
             // Create noise model for gravity alignment:
             auto accNoise = gtsam::noiseModel::Isotropic::Sigma(
                 3, mrpt::DEG2RAD(params_.imu_normalized_gravity_alignment_sigma));
@@ -771,6 +777,42 @@ void StateEstimationSmoother::fuse_imu_locked(const mrpt::obs::CObservationIMU& 
             state_.gtsam->newFactors.emplace_shared<mola::factors::MeasuredGravityFactor>(
                 symbol_T_enu_to_map, T(this_kf_id), sensorOnVehicle, measuredGravityNormalized,
                 accNoise);
+        }
+    }
+
+    // Angular velocity (gyroscope) observation: a direct prior on this keyframe's
+    // body-frame angular-velocity variable, so a genuine, fast rotation is represented
+    // in the graph immediately instead of only through the constant-velocity kinematic
+    // factor between keyframes (see imu_angular_velocity_sigma's docstring).
+    if (hasAngularVelocity)
+    {
+        const gtsam::Vector3 measuredW_sensor = {
+            imu.get(mrpt::obs::IMU_WX), imu.get(mrpt::obs::IMU_WY), imu.get(mrpt::obs::IMU_WZ)};
+
+        if (!measuredW_sensor.allFinite())
+        {
+            MRPT_LOG_THROTTLE_WARN(
+                60.0, "Ignoring invalid (NaN or Inf) IMU angular velocity reading");
+        }
+        else
+        {
+            // Angular velocity is a free vector under a fixed rigid rotation (no lever-arm
+            // term, unlike linear velocity):
+            const gtsam::Vector3 measuredW_vehicle = sensorOnVehicle.rotation() * measuredW_sensor;
+
+            // Robust kernel: this is one raw, un-averaged sample of a noisy, often
+            // vibration-contaminated signal, used as a direct observation of a state
+            // variable. A single outlier (or a sigma set optimistically for the actual
+            // platform) would otherwise drag the whole sliding window through the
+            // body-frame coupling of the constant-velocity factor, which can only
+            // absorb the disagreement by rotating the poses. Huber bounds how far any
+            // one reading can pull the solution while leaving well-behaved samples
+            // fully informative.
+            auto gyroNoise = gtsam::noiseModel::Robust::Create(
+                gtsam::noiseModel::mEstimator::Huber::Create(GYRO_HUBER_K),
+                gtsam::noiseModel::Isotropic::Sigma(3, params_.imu_angular_velocity_sigma));
+
+            state_.gtsam->newFactors.addPrior(W(this_kf_id), measuredW_vehicle, gyroNoise);
         }
     }
 }
@@ -1108,105 +1150,118 @@ std::optional<NavState> StateEstimationSmoother::estimated_navstate(
         return {};
     }
 
-    MRPT_TODO("Implement probabilistic extrapolation");
-    // For now, approximate extrapolation only:
     NavState ret = retKf;
 
-    // Approximate twist uncertainty growth due to random walk:
+    // The covariance propagation below (matrix inversions, information-form
+    // conversions and Gaussian pose composition) can throw if a covariance is
+    // not positive definite (e.g. an under-constrained factor graph in the
+    // first instants of fusion). Treat that like the other "not ready yet"
+    // early returns rather than letting it take down the caller's thread.
+    try
     {
-        auto twist_cov = ret.twist_inv_cov.inverse_LLt();
-        for (int i = 0; i < 3; i++)
+        // Anchor twist covariance (before random-walk growth), reused as the
+        // current-velocity uncertainty of the pose increment below.
+        const mrpt::math::CMatrixDouble66 anchorTwistCov = retKf.twist_inv_cov.inverse_LLt();
+
+        // Twist uncertainty growth due to the acceleration random walk:
         {
-            twist_cov(0 + i, 0 + i) +=
-                mrpt::square(params_.sigma_random_walk_acceleration_linear * closestFrameDtSigned);
+            auto twist_cov = anchorTwistCov;
+            for (int i = 0; i < 3; i++)
+            {
+                twist_cov(0 + i, 0 + i) += mrpt::square(
+                    params_.sigma_random_walk_acceleration_linear * closestFrameDtSigned);
 
-            twist_cov(3 + i, 3 + i) +=
-                mrpt::square(params_.sigma_random_walk_acceleration_angular * closestFrameDtSigned);
+                twist_cov(3 + i, 3 + i) += mrpt::square(
+                    params_.sigma_random_walk_acceleration_angular * closestFrameDtSigned);
+            }
+            ret.twist_inv_cov = twist_cov.inverse_LLt();
         }
-        ret.twist_inv_cov = twist_cov.inverse_LLt();
-    }
 
-    // Extrapolate the low-pass-filtered velocity instead of the boundary
-    // keyframe's raw (noisy) twist, when anchoring on the newest keyframe
-    // (mirrors the async fast-predictor path).
-    if (params_.predict_twist_filter_enabled && state_.filtered_predict_twist.has_value() &&
-        !state_.stamp2frame_index.empty() &&
-        *closesFrameIdx == state_.stamp2frame_index.getDirectMap().rbegin()->second)
-    {
-        ret.twist = *state_.filtered_predict_twist;
-    }
+        // Extrapolate the low-pass-filtered velocity instead of the boundary
+        // keyframe's raw (noisy) twist, when anchoring on the newest keyframe
+        // (mirrors the async fast-predictor path).
+        if (params_.predict_twist_filter_enabled && state_.filtered_predict_twist.has_value() &&
+            !state_.stamp2frame_index.empty() &&
+            *closesFrameIdx == state_.stamp2frame_index.getDirectMap().rbegin()->second)
+        {
+            ret.twist = *state_.filtered_predict_twist;
+        }
 
-    // 3) Produce the pose in the requested frame.
-    if (frame_id == params_.reference_frame_name)
-    {
-        // Reference ({map}) frame: extrapolate the closest keyframe pose forward
-        // with the configured kinematic model.
-        ret.pose.mean = ret.pose.mean + body_twist_delta(params_, ret.twist, closestFrameDtSigned);
-        return ret;
-    }
+        // 3) Produce the pose in the requested frame.
+        if (frame_id == params_.reference_frame_name)
+        {
+            // Reference ({map}) frame: extrapolate the closest keyframe pose
+            // forward with the configured kinematic model, propagating covariance.
+            mrpt::poses::CPose3DPDFGaussian anchorPose;
+            anchorPose.copyFrom(retKf.pose);
+            ret.pose.copyFrom(extrapolate_pose_pdf(
+                params_, anchorPose, ret.twist, anchorTwistCov, closestFrameDtSigned));
+            return ret;
+        }
 
-    // The requested odometry frame may not have been registered yet (e.g. the
-    // very first query of a brand-new frame_id, before any fuse_pose()/
-    // fuse_odometry() call has registered it). Treat that as "not ready yet".
-    const auto it = state_.known_odom_frames.find_key(frame_id);
-    if (it == state_.known_odom_frames.getDirectMap().end())
-    {
-        MRPT_LOG_THROTTLE_WARN_FMT(
-            5.0, "[estimated_navstate] Requested unknown odometry frame_id='%s'", frame_id.c_str());
-        return {};
-    }
-    const auto requestedFrameIdx = it->second;
+        // The requested odometry frame may not have been registered yet (e.g.
+        // the very first query of a brand-new frame_id, before any fuse_pose()/
+        // fuse_odometry() call has registered it). Treat that as "not ready yet".
+        const auto it = state_.known_odom_frames.find_key(frame_id);
+        if (it == state_.known_odom_frames.getDirectMap().end())
+        {
+            MRPT_LOG_THROTTLE_WARN_FMT(
+                5.0, "[estimated_navstate] Requested unknown odometry frame_id='%s'",
+                frame_id.c_str());
+            return {};
+        }
+        const auto requestedFrameIdx = it->second;
 
-    // Non-reference odometry frame {odom_i}: anchor on the source's OWN last raw
-    // pose in {odom_i} and extrapolate by the body-twist increment, instead of
-    // reconstructing it globally as X(kf) (-) T_map_to_odom_i. The fixed-lag
-    // window keeps that global reconstruction's {map}-correction leak small here,
-    // but anchoring on the raw pose removes it and keeps the prediction immune to
-    // geo-ref / loop-closure / per-solve jitter.
-    const auto itRaw = state_.last_raw_pose_by_source.find(requestedFrameIdx);
-    if (itRaw == state_.last_raw_pose_by_source.end())
-    {
-        // No raw pose received from this source yet: fall back to the global
-        // conversion (correct while {map} and {odom_i} still coincide).
-        const auto itFrame = state_.last_estimated_frames.find(requestedFrameIdx);
-        if (itFrame == state_.last_estimated_frames.end())
+        // Non-reference odometry frame {odom_i}: anchor on the source's OWN last
+        // raw pose in {odom_i} and extrapolate by the body-twist increment,
+        // instead of reconstructing it globally as X(kf) (-) T_map_to_odom_i. The
+        // fixed-lag window keeps that global reconstruction's {map}-correction
+        // leak small here, but anchoring on the raw pose removes it and keeps the
+        // prediction immune to geo-ref / loop-closure / per-solve jitter.
+        const auto itRaw = state_.last_raw_pose_by_source.find(requestedFrameIdx);
+        if (itRaw == state_.last_raw_pose_by_source.end())
+        {
+            // No raw pose received from this source yet: fall back to the global
+            // conversion (correct while {map} and {odom_i} still coincide).
+            const auto itFrame = state_.last_estimated_frames.find(requestedFrameIdx);
+            if (itFrame == state_.last_estimated_frames.end())
+            {
+                return {};
+            }
+            mrpt::poses::CPose3DPDFGaussian anchorPose;
+            anchorPose.copyFrom(retKf.pose);
+            const auto mapPred = extrapolate_pose_pdf(
+                params_, anchorPose, ret.twist, anchorTwistCov, closestFrameDtSigned);
+            // Transform the {map}-frame prediction into {odom_i}: pred (-) T_frame_wrt_map.
+            ret.pose.copyFrom(mapPred - itFrame->second);
+            return ret;
+        }
+
+        // Frame-local extrapolation from the source's last raw pose in {odom_i}:
+        const auto&  rawAnchor = itRaw->second;
+        const double dtPred    = mrpt::system::timeDifference(rawAnchor.stamp, timestamp);
+
+        if (std::abs(dtPred) > params_.max_time_to_use_velocity_model)
         {
             return {};
         }
-        ret.pose.mean = ret.pose.mean + body_twist_delta(params_, ret.twist, closestFrameDtSigned);
-        mrpt::poses::CPose3DPDFGaussianInf posePdfFrame_wrt_map_inf;
-        posePdfFrame_wrt_map_inf.copyFrom(itFrame->second);
-        ret.pose = ret.pose - posePdfFrame_wrt_map_inf;
+
+        // The anchor is the front end's own near-exact pose in {odom_i}, so
+        // prediction uncertainty is dominated by the one-step extrapolation, not
+        // the absolute {map}-frame keyframe covariance.
+        ret.pose.copyFrom(
+            extrapolate_pose_pdf(params_, rawAnchor.pose, ret.twist, anchorTwistCov, dtPred));
+
         return ret;
     }
-
-    // Frame-local extrapolation from the source's last raw pose in {odom_i}:
-    const auto&  rawAnchor = itRaw->second;
-    const double dtPred    = mrpt::system::timeDifference(rawAnchor.stamp, timestamp);
-
-    if (std::abs(dtPred) > params_.max_time_to_use_velocity_model)
+    catch (const std::exception& e)
     {
+        MRPT_LOG_DEBUG_FMT(
+            "[estimated_navstate] Covariance propagation not ready yet (factor graph likely "
+            "still under-constrained): %s",
+            e.what());
         return {};
     }
-
-    mrpt::poses::CPose3DPDFGaussian pred;
-    pred.mean = rawAnchor.pose.mean + body_twist_delta(params_, ret.twist, dtPred);
-
-    // Frame-local covariance: the anchor is the front end's own (near-exact) pose
-    // in {odom_i}, so prediction uncertainty is dominated by the one-step
-    // extrapolation, not the absolute {map}-frame keyframe covariance.
-    pred.cov         = rawAnchor.pose.cov;
-    const double adt = std::abs(dtPred);
-    for (int i = 0; i < 3; i++)
-    {
-        pred.cov(i, i) += mrpt::square(params_.sigma_random_walk_acceleration_linear * adt * adt);
-        pred.cov(3 + i, 3 + i) +=
-            mrpt::square(params_.sigma_random_walk_acceleration_angular * adt * adt);
-    }
-
-    ret.pose.copyFrom(pred);  // NavState.pose is CPose3DPDFGaussianInf
-
-    return ret;
 }
 
 std::set<std::string> StateEstimationSmoother::known_odometry_frame_ids()
@@ -1332,6 +1387,31 @@ void StateEstimationSmoother::onNewObservation(const CObservation::ConstPtr& o)
     }
 }
 
+double StateEstimationSmoother::angular_const_vel_sigma(double dt) const
+{
+    // Random-walk term: how much the angular velocity may drift on its own over dt.
+    const double sigmaModel = params_.sigma_random_walk_acceleration_angular * dt;
+
+    // Measurement term: when gyro readings are fused as direct observations of w
+    // (imu_angular_velocity_sigma > 0), two consecutive keyframes hold two
+    // INDEPENDENT noisy measurements, so their difference already has a spread of
+    // sqrt(2)*sigma no matter how close in time they are. The random-walk term
+    // alone does not account for that and vanishes with dt, while this graph
+    // routinely produces keyframe pairs only ~10 ms apart (a pose observation
+    // landing just past the merge threshold of an existing IMU keyframe). There
+    // the model term is several times tighter than the sensor noise it is being
+    // asked to explain, and the resulting conflict cannot be absorbed by w alone:
+    // this factor's residual is R_i*w_i - R_j*w_j, so the optimizer can only
+    // reduce it by rotating the poses, which blows up the whole window (seen as
+    // an IndeterminantLinearSystemException on an unrelated pose/velocity
+    // variable). Adding both terms in quadrature keeps the factor consistent with
+    // the data it competes against, and reduces to the pure random-walk model
+    // when no gyro is fused.
+    const double sigmaMeas = std::sqrt(2.0) * params_.imu_angular_velocity_sigma;
+
+    return std::hypot(sigmaModel, sigmaMeas);
+}
+
 /// Implementation of Eqs (1),(4) in the MOLA RSS2019 paper.
 void StateEstimationSmoother::addFactor(const AbsFactorConstVelKinematics& f)
 {
@@ -1351,8 +1431,8 @@ void StateEstimationSmoother::addFactor(const AbsFactorConstVelKinematics& f)
     ASSERT_GT_(dt, 0.);
 
     // errors in constant vel:
-    const double std_lin_vel = params_.sigma_random_walk_acceleration_linear;
-    const double std_ang_vel = params_.sigma_random_walk_acceleration_angular;
+    const double std_lin_vel   = params_.sigma_random_walk_acceleration_linear;
+    const double sigma_ang_vel = angular_const_vel_sigma(dt);
 
     if (dt > params_.time_between_frames_to_warning)
     {
@@ -1382,7 +1462,7 @@ void StateEstimationSmoother::addFactor(const AbsFactorConstVelKinematics& f)
     // \omega is in the body frame, we need a special factor to rotate it:
     // See line 4 of eq (4) in the MOLA RSS2019 paper.
     sink.emplace_shared<mola::factors::FactorConstLocalVelocityPose>(
-        kTi, kbWi, kTj, kbWj, gtsam::noiseModel::Isotropic::Sigma(3, std_ang_vel * dt));
+        kTi, kbWi, kTj, kbWj, gtsam::noiseModel::Isotropic::Sigma(3, sigma_ang_vel));
 
     // 2) Add kinematics / numerical integration factor
     // ---------------------------------------------------
@@ -1419,8 +1499,8 @@ void StateEstimationSmoother::addFactor(const AbsFactorTricycleKinematics& f)
     ASSERT_GT_(dt, 0.);
 
     // errors in constant vel:
-    const double std_lin_vel = params_.sigma_random_walk_acceleration_linear;
-    const double std_ang_vel = params_.sigma_random_walk_acceleration_angular;
+    const double std_lin_vel   = params_.sigma_random_walk_acceleration_linear;
+    const double sigma_ang_vel = angular_const_vel_sigma(dt);
 
     if (dt > params_.time_between_frames_to_warning)
     {
@@ -1449,7 +1529,7 @@ void StateEstimationSmoother::addFactor(const AbsFactorTricycleKinematics& f)
     // \omega is in the body frame, we need a special factor to rotate it:
     // See line 4 of eq (4) in the MOLA RSS2019 paper.
     sink.emplace_shared<mola::factors::FactorConstLocalVelocityPose>(
-        kTi, kbWi, kTj, kbWj, gtsam::noiseModel::Isotropic::Sigma(3, std_ang_vel * dt));
+        kTi, kbWi, kTj, kbWj, gtsam::noiseModel::Isotropic::Sigma(3, sigma_ang_vel));
 
     // In the tricycle model, body v_y must be zero:
     {
@@ -1461,7 +1541,7 @@ void StateEstimationSmoother::addFactor(const AbsFactorTricycleKinematics& f)
     }
     // In the tricycle model, body w_x,w_y must be zero:
     {
-        const Eigen::Vector3d sigmas = {std_ang_vel * dt, std_ang_vel * dt, TRICYCLE_LARGE_SIGMAS};
+        const Eigen::Vector3d sigmas = {sigma_ang_vel, sigma_ang_vel, TRICYCLE_LARGE_SIGMAS};
 
         sink.emplace_shared<gtsam::PriorFactor<gtsam::Point3>>(
             kbWj, gtsam::Point3::Zero(), gtsam::noiseModel::Diagonal::Sigmas(sigmas));
