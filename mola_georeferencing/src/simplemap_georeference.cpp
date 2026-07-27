@@ -35,7 +35,6 @@
 #include <mola_gtsam_factors/imu_helpers.h>
 
 #include <algorithm>
-#include <iomanip>
 #include <limits>
 #include <iomanip>
 
