@@ -41,6 +41,7 @@
 #include <mrpt/obs/CObservationGPS.h>
 #include <mrpt/obs/CObservationIMU.h>
 #include <mrpt/obs/CObservationOdometry.h>
+#include <mrpt/poses/CPose3DInterpolator.h>
 #include <mrpt/poses/CPose3DPDFGaussian.h>
 #include <mrpt/system/COutputLogger.h>
 #include <mrpt/system/CTimeLogger.h>
@@ -204,6 +205,23 @@ class StateEstimationSmoother : public mola::NavStateFilter,
     [[nodiscard]] std::optional<NavState> estimated_navstate(
         const mrpt::Clock::time_point& timestamp, const std::string& frame_id) override;
 
+    /** Implements NavStateFilter::estimated_trajectory().
+     *
+     *  Returns the smoothed trajectory: each keyframe's pose as it was when it
+     *  left the sliding window, i.e. after every measurement the window could
+     *  bring to bear on it, plus the keyframes still inside the window at their
+     *  current value. This is a different quantity from estimated_navstate(),
+     *  which anchors on the newest keyframe and extrapolates: the newest state
+     *  is the least optimized one, the oldest is the most.
+     *
+     *  Requires `keep_finalized_trajectory` (off by default). An odometry
+     *  frame is served through the latest estimate of that frame's transform,
+     *  held constant over the trajectory.
+     */
+    [[nodiscard]] std::optional<mrpt::poses::CPose3DInterpolator> estimated_trajectory(
+        const mrpt::Clock::time_point& start_time, const mrpt::Clock::time_point& end_time,
+        const std::string& frame_id) override;
+
     /// Returns a list of known odometry frame_ids:
     [[nodiscard]] auto known_odometry_frame_ids() -> std::set<std::string>;
 
@@ -267,6 +285,11 @@ class StateEstimationSmoother : public mola::NavStateFilter,
     };
 
     // Accesses to this struct values in state_ must be protected by stateMutex_
+    /// Decimates IMU readings to one per imu_min_sample_period. Defined in the
+    /// .cpp only, so this header's layout does not depend on the version of
+    /// mola_imu_preintegration it is compiled against.
+    struct ImuDecimator;
+
     struct State
     {
         State();
@@ -314,6 +337,27 @@ class StateEstimationSmoother : public mola::NavStateFilter,
         };
         std::map<odometry_frameid_t, RawSourcePose> last_raw_pose_by_source;
 
+        /// Per-source bookkeeping for the relative-factor formulation of
+        /// fuse_pose() (see Parameters::relative_factors_frame_ids_re): the
+        /// keyframe carrying that source's one absolute anchor factor, and the
+        /// tail of its chain of increment factors.
+        struct RelativePoseChain
+        {
+            std::optional<frame_index_t>                   anchor_kf;
+            std::optional<frame_index_t>                   last_kf;
+            std::optional<mrpt::poses::CPose3DPDFGaussian> last_pose_in_odom;
+
+            /// Timestamp of the last accepted sample: readings not strictly
+            /// newer are dropped, since the chain tail is what the next
+            /// increment is measured from.
+            std::optional<mrpt::Clock::time_point> last_stamp;
+        };
+        std::map<odometry_frameid_t, RelativePoseChain> relative_pose_chains;
+
+        /// Per fuse_pose() source, the timestamp of the last reading that was
+        /// allowed through, for Parameters::pose_min_sample_period.
+        std::map<odometry_frameid_t, mrpt::Clock::time_point> last_kept_pose_stamp;
+
         /** For real-time mode operation (not offline): returns the current extrapolated stamp,
          *  by adding the difference between the last observation wallclock time and now to the
          *  last observation timestamp.
@@ -344,9 +388,33 @@ class StateEstimationSmoother : public mola::NavStateFilter,
         /// accumulated increment.
         std::optional<mrpt::Clock::time_point> last_wheels_odometry_stamp;
 
-        /// Stamp of the last IMU reading that was actually processed. Used by
-        /// imu_min_sample_period to skip higher-rate readings.
-        std::optional<mrpt::Clock::time_point> last_processed_imu_stamp;
+        /// Absolute dead-reckoned wheel-odometry pose in its own {odom_i}
+        /// frame, with the uncertainty accumulated over the whole history, for
+        /// the one factor resolving T_map_to_odom_i and for the source's
+        /// own-frame pose estimated_navstate() extrapolates from. The pose is
+        /// the same one the source reports, and the covariance is the composed
+        /// motion-model covariance of every increment since the first reading.
+        /// Reset with the estimator.
+        std::optional<mrpt::poses::CPose3DPDFGaussian> wheels_odometry_accumulated;
+
+        /// Tail keyframe of the wheel-odometry relative-factor chain. Reset
+        /// with the estimator.
+        std::optional<frame_index_t> last_wheels_odometry_kf;
+
+        /// Odometry reading representing last_wheels_odometry_kf: the first
+        /// one that landed on it. The next increment factor starts here, so
+        /// later readings on the same keyframe lose no motion.
+        std::optional<mrpt::poses::CPose2D> last_wheels_odometry_at_kf;
+
+        /// Keyframe carrying the single absolute pose-in-{odom_i} factor that
+        /// resolves T_map_to_odom_i for wheel odometry. Set once
+        /// and never renewed: the fixed-lag smoother marginalizes keyframes
+        /// rather than dropping their factors, so that information survives its
+        /// own keyframe. See fuse_odometry_relative_locked().
+        std::optional<frame_index_t> wheels_odometry_anchor_kf;
+
+        /// Created on first use. See ImuDecimator.
+        std::shared_ptr<ImuDecimator> imu_decimator;
 
         /** Refer to Parameters for possible sources of this.
          * Anyways: this will always hold either the estimated or the fixed (externally set)
@@ -367,11 +435,18 @@ class StateEstimationSmoother : public mola::NavStateFilter,
         RegexCache do_process_imu_labels_re;
         RegexCache do_process_odometry_labels_re;
         RegexCache do_process_gnss_labels_re;
+        RegexCache relative_factors_frame_ids_re;
     };
 
     State      state_;
     std::mutex stateMutex_;
-    bool       params_loaded_ = false;
+
+    /// Poses of the keyframes already marginalized out, in the reference frame,
+    /// each recorded at the moment it left the window. Only filled when
+    /// `keep_finalized_trajectory` is set. Kept outside State so that a reset
+    /// of the factor graph does not discard the history already collected.
+    mrpt::poses::CPose3DInterpolator finalizedTrajectory_;
+    bool                             params_loaded_ = false;
 
     /// Lock-free read model for async_backend mode. Populated at the end of each
     /// solve; queried by estimated_navstate()/spinOnce() without stateMutex_.
@@ -418,12 +493,27 @@ class StateEstimationSmoother : public mola::NavStateFilter,
     /// Creates or returns the existing ID, for an odometry frame_id:
     [[nodiscard]] odometry_frameid_t add_or_get_odom_frame_id(const std::string& frame_id_name);
 
+    /// While T_map_to_odom_i is still pending insertion into the smoother, sets
+    /// its initial value consistent with a reading `poseInOdom` of keyframe `kf`.
+    void seed_odom_frame_locked(
+        odometry_frameid_t frame_id_idx, frame_index_t kf, const mrpt::poses::CPose3D& poseInOdom);
+
+    /// Some measurement now observes {map}: its gauge anchor is no longer needed.
+    void mark_map_observed_locked();
+
     // ---- _locked variants: assume stateMutex_ is already held by the caller ----
     void reset_locked();
     void reinitialize_gtsam_locked();
     void fuse_pose_locked(
         const mrpt::Clock::time_point& timestamp, const mrpt::poses::CPose3DPDFGaussian& pose,
         const std::string& frame_id);
+
+    /// Wheel-odometry fusion: BetweenFactors between consecutive odometry
+    /// keyframes, plus one absolute factor, added once, to resolve
+    /// T_map_to_odom_i.
+    void fuse_odometry_relative_locked(
+        const mrpt::obs::CObservationOdometry& odom, const std::string& odomName,
+        const mrpt::poses::CPose3DPDFGaussian& absolutePoseInOdom);
     void fuse_odometry_locked(
         const mrpt::obs::CObservationOdometry& odom, const std::string& odomName);
     void fuse_imu_locked(const mrpt::obs::CObservationIMU& imu);

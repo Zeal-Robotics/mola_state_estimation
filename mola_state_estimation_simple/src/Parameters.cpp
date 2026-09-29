@@ -21,6 +21,8 @@
 
 #include <mola_state_estimation_simple/Parameters.h>
 
+#include <cmath>
+
 namespace mola::state_estimation_simple
 {
 
@@ -36,12 +38,22 @@ void Parameters::loadFrom(const mrpt::containers::yaml& cfg)
 
     MCP_LOAD_OPT(cfg, sigma_imu_angular_velocity);
 
+    MCP_LOAD_OPT(cfg, sigma_wheel_odom_linear_vel);
+    MCP_LOAD_OPT(cfg, sigma_wheel_odom_angular_vel);
+
     MCP_LOAD_OPT(cfg, velocity_filter_enabled);
 
     MCP_LOAD_OPT(cfg, enforce_planar_motion);
 
+    MCP_LOAD_OPT(cfg, imu_propagation);
+    MCP_LOAD_OPT(cfg, imu_propagation_max_time);
+    MCP_LOAD_OPT(cfg, gravity_magnitude);
+    MCP_LOAD_OPT(cfg, imu_propagation_sigma_acc);
+    MCP_LOAD_OPT(cfg, imu_propagation_sigma_bias);
+
     MCP_LOAD_OPT(cfg, do_process_imu_labels_re);
     MCP_LOAD_OPT(cfg, do_process_odometry_labels_re);
+    MCP_LOAD_OPT(cfg, fuse_ground_truth_label);
     MCP_LOAD_OPT(cfg, do_process_gnss_labels_re);
 
     MCP_LOAD_OPT(cfg, gnss_enabled);
@@ -60,6 +72,18 @@ void Parameters::loadFrom(const mrpt::containers::yaml& cfg)
         {
             tw[i] = seq.at(i).as<double>();
         }
+    }
+
+    MCP_LOAD_OPT(cfg, initial_twist_sigma_lin);
+    MCP_LOAD_OPT(cfg, initial_twist_sigma_ang);
+
+    if (initial_twist != mrpt::math::TTwist3D())
+    {
+        // A zero, negative, or non-finite sigma would build a singular
+        // last_twist_cov, which later throws out of inverse_LLt() in
+        // estimated_navstate(). Catch it here, at config-load time, instead.
+        ASSERT_(std::isfinite(initial_twist_sigma_lin) && initial_twist_sigma_lin > 0);
+        ASSERT_(std::isfinite(initial_twist_sigma_ang) && initial_twist_sigma_ang > 0);
     }
 }
 

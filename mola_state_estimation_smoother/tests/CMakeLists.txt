@@ -14,6 +14,13 @@ mola_add_test(
 )
 
 mola_add_test(
+  TARGET  test-odometry-long-drift
+  SOURCES test-odometry-long-drift.cpp
+  LINK_LIBRARIES
+    mola::mola_state_estimation_smoother
+)
+
+mola_add_test(
   TARGET  test-static-gnss-imu-orientation
   SOURCES test-static-gnss-imu-orientation.cpp
   LINK_LIBRARIES
@@ -23,6 +30,55 @@ mola_add_test(
 mola_add_test(
   TARGET  test-relocalize-set-geo-reference
   SOURCES test-relocalize-set-geo-reference.cpp
+  LINK_LIBRARIES
+    mola::mola_state_estimation_smoother
+)
+
+mola_add_test(
+  TARGET  test-odometry-relative-same-keyframe
+  SOURCES test-odometry-relative-same-keyframe.cpp
+  LINK_LIBRARIES
+    mola::mola_state_estimation_smoother
+)
+
+mola_add_test(
+  TARGET  test-pose-keyframe-decimation
+  SOURCES test-pose-keyframe-decimation.cpp
+  LINK_LIBRARIES
+    mola::mola_state_estimation_smoother
+)
+
+mola_add_test(
+  TARGET  test-pose-robust-huber
+  SOURCES test-pose-robust-huber.cpp
+  LINK_LIBRARIES
+    mola::mola_state_estimation_smoother
+)
+
+mola_add_test(
+  TARGET  test-relative-pose-increment-growth
+  SOURCES test-relative-pose-increment-growth.cpp
+  LINK_LIBRARIES
+    mola::mola_state_estimation_smoother
+)
+
+mola_add_test(
+  TARGET  test-relative-pose-increment-sigma
+  SOURCES test-relative-pose-increment-sigma.cpp
+  LINK_LIBRARIES
+    mola::mola_state_estimation_smoother
+)
+
+mola_add_test(
+  TARGET  test-relative-source-map-to-odom
+  SOURCES test-relative-source-map-to-odom.cpp
+  LINK_LIBRARIES
+    mola::mola_state_estimation_smoother
+)
+
+mola_add_test(
+  TARGET  test-relative-pose-factors
+  SOURCES test-relative-pose-factors.cpp
   LINK_LIBRARIES
     mola::mola_state_estimation_smoother
 )
@@ -104,3 +160,24 @@ mola_add_test(
     mola::mola_state_estimation_smoother
 )
 
+
+mola_add_test(
+  TARGET  test-relative-pose-sigma-floor
+  SOURCES test-relative-pose-sigma-floor.cpp
+  LINK_LIBRARIES
+    mola::mola_state_estimation_smoother
+)
+
+mola_add_test(
+  TARGET  test-finalized-trajectory
+  SOURCES test-finalized-trajectory.cpp
+  LINK_LIBRARIES
+    mola::mola_state_estimation_smoother
+)
+
+mola_add_test(
+  TARGET  test-gauge-anchors
+  SOURCES test-gauge-anchors.cpp
+  LINK_LIBRARIES
+    mola::mola_state_estimation_smoother
+)

@@ -5,7 +5,7 @@
 -->
 <package format="3">
   <name>mola_state_estimation_simple</name>
-  <version>2.4.2</version>
+  <version>3.0.1</version>
   <description>SE(3) pose and twist path data fusion estimator</description>
 
   <maintainer email="joseluisblancoc@gmail.com">Jose-Luis Blanco-Claraco</maintainer>
@@ -18,7 +18,8 @@
   <depend>mola_kernel</depend>
   <depend>mola_imu_preintegration</depend>
   <depend>mola_yaml</depend>
-  <depend>mrpt_libobs</depend>
+  <depend>mrpt_obs</depend>
+  <build_depend>eigen</build_depend>
 
   <doc_depend>doxygen</doc_depend>
 

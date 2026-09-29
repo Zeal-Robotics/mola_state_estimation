@@ -61,23 +61,72 @@
 #include <mola_gtsam_factors/Pose3RotationFactor.h>
 #include <mola_gtsam_factors/imu_helpers.h>
 
+#if __has_include(<mola_imu_preintegration/ImuAverager.h>)
+#include <mola_imu_preintegration/ImuAverager.h>
+/** Feature macro: mola_imu_preintegration provides mola::imu::ImuAverager, used
+ *  to average IMU readings when decimating them (imu_min_sample_period). Older
+ *  releases fall back to keeping one raw reading per period. */
+#define MOLA_SMOOTHER_HAS_IMU_AVERAGER 1
+#endif
+
 #include "FastPredictor.h"
 #include "Snapshot.h"
 #include "extrapolation.h"
 
 // std:
 #include <algorithm>
+#include <chrono>
+#include <fstream>
+#include <limits>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
 #include <utility>
 
 // arguments: class_name, parent_class, class namespace
 IMPLEMENTS_MRPT_OBJECT(
     StateEstimationSmoother, mola::ExecutableBase, mola::state_estimation_smoother)
 
+struct mola::state_estimation_smoother::StateEstimationSmoother::ImuDecimator
+{
+    /// Returns the reading to fuse for this input, if any. Each sensor label is
+    /// decimated on its own: readings from IMUs mounted differently must never
+    /// be averaged together.
+    std::optional<mrpt::obs::CObservationIMU> add(
+        const mrpt::obs::CObservationIMU& imu, double period)
+    {
+        auto& s = bySensor[imu.sensorLabel];
+#if defined(MOLA_SMOOTHER_HAS_IMU_AVERAGER)
+        return s.averager.add(imu, period);
+#else
+        if (period > 0 && s.lastStamp.has_value() &&
+            mrpt::system::timeDifference(*s.lastStamp, imu.timestamp) < period)
+        {
+            return std::nullopt;
+        }
+        s.lastStamp = imu.timestamp;
+        return imu;
+#endif
+    }
+
+    struct PerSensor
+    {
+#if defined(MOLA_SMOOTHER_HAS_IMU_AVERAGER)
+        mola::imu::ImuAverager averager;
+#else
+        std::optional<mrpt::Clock::time_point> lastStamp;
+#endif
+    };
+    std::map<std::string, PerSensor> bySensor;
+};
+
 namespace
 {
 constexpr double ENU2MAP_WEAK_SIGMA          = 1e4;
 constexpr double INIT_ODOM_FRAME_POSE_SIGMA  = 1e3;
 constexpr double FIRST_POSE_WEAK_PRIOR_SIGMA = 1e6;
+constexpr double GAUGE_ANCHOR_SIGMA          = 1e-3;
 constexpr double PLANAR_XY_SIGMA             = 1e10;
 constexpr double PLANAR_Z_SIGMA              = 1e-4;
 constexpr double TRICYCLE_LARGE_SIGMAS       = 1e6;
@@ -96,6 +145,148 @@ void enforce_planar_twist(mrpt::math::TTwist3D& tw)
     tw.vz = 0;
     tw.wx = 0;
     tw.wy = 0;
+}
+
+// Seconds on a monotone, always-positive axis (the clock's own tick origin),
+// for the GTSAM fixed-lag smoother's key timestamps.
+//
+// NOT mrpt::Clock::toDouble(): that rebases onto the UNIX epoch with an
+// UNSIGNED subtraction, so a timestamp even a millisecond before it reads
+// ~1.8e12 s instead of a small negative number. Datasets whose clock starts at
+// zero do produce such timestamps, and one of them among the key stamps moves
+// the smoother's notion of "now" 58000 years into the future, marginalizing
+// every genuine keyframe on arrival. Only differences of these values matter
+// to GTSAM, so the origin is free; being consistent is what is not.
+double key_stamp_seconds(const mrpt::Clock::time_point& t)
+{
+    return std::chrono::duration<double>(t.time_since_epoch()).count();
+}
+
+// Debug instrumentation: dumps every estimated_navstate() result (the pose +
+// covariance that LIO uses as ICP initial guess AND prior, plus the returned
+// twist) so the prior-vs-data weighting and the velocity feedback can be
+// analyzed offline. Same file format and same env var as the lightweight
+// estimator's, so one script reads both. Disabled unless MOLA_NAVSTATE_DUMP is
+// set to a path.
+std::ofstream* navstate_dump_stream()
+{
+    static std::unique_ptr<std::ofstream> s_stream = []() -> std::unique_ptr<std::ofstream>
+    {
+        const std::string path = mrpt::get_env<std::string>("MOLA_NAVSTATE_DUMP");
+        if (path.empty())
+        {
+            return nullptr;
+        }
+        auto st = std::make_unique<std::ofstream>(path, std::ios::out | std::ios::trunc);
+        if (!st->is_open())
+        {
+            return nullptr;
+        }
+        (*st) << "tim,dt,"
+                 "x,y,z,yaw,pitch,roll,"
+                 "tw_vx,tw_vy,tw_vz,tw_wx,tw_wy,tw_wz,"
+                 "cov_x,cov_y,cov_z,cov_yaw,cov_pitch,cov_roll,"
+                 "covinv_x,covinv_y,covinv_z,covinv_yaw,covinv_pitch,covinv_roll\n";
+        return st;
+    }();
+    return s_stream.get();
+}
+
+// One row of the CSV above. `dt` is the extrapolation interval from the anchor
+// keyframe; a row is written only when a state was actually produced, so a gap
+// in the file marks a scan the front end ran with no motion model at all.
+void navstate_dump_row(
+    const mrpt::Clock::time_point& timestamp, double dt, const mola::NavState& ns)
+{
+    std::ofstream* st = navstate_dump_stream();
+    if (!st)
+    {
+        return;
+    }
+
+    // estimated_navstate() is callable concurrently and, in async mode, holds no
+    // lock of its own, so two queries could otherwise interleave halves of a row.
+    static std::mutex           s_dumpMutex;
+    std::lock_guard<std::mutex> lck(s_dumpMutex);
+
+    const auto& m = ns.pose.mean;
+    (*st) << mrpt::format("%.6f", mrpt::Clock::toDouble(timestamp)) << "," << dt << ","  //
+          << m.x() << "," << m.y() << "," << m.z() << "," << m.yaw() << "," << m.pitch() << ","
+          << m.roll();
+
+    const auto& tw = ns.twist;
+    (*st) << "," << tw.vx << "," << tw.vy << "," << tw.vz << "," << tw.wx << "," << tw.wy << ","
+          << tw.wz;
+
+    const mrpt::math::CMatrixDouble66 cov = ns.pose.cov_inv.inverse_LLt();
+    for (int i = 0; i < 6; i++)
+    {
+        (*st) << "," << cov(i, i);
+    }
+    for (int i = 0; i < 6; i++)
+    {
+        (*st) << "," << ns.pose.cov_inv(i, i);
+    }
+    (*st) << "\n";
+    st->flush();
+}
+
+/// Wraps a pose factor's Gaussian noise model in a Huber m-estimator when
+/// `threshold` (in whitened units) is > 0. Huber is convex, so unlike a
+/// redescending kernel it cannot switch off a correct measurement whose
+/// variable starts far from it, as a new keyframe seeded at its neighbor's
+/// pose does.
+gtsam::SharedNoiseModel with_huber(const gtsam::SharedNoiseModel& base, double threshold)
+{
+    if (threshold <= 0)
+    {
+        return base;
+    }
+    return gtsam::noiseModel::Robust::Create(
+        gtsam::noiseModel::mEstimator::Huber::Create(threshold), base);
+}
+
+/// Replaces the 3x3 diagonal block of a 6x6 pose covariance starting at
+/// `first` (0: translation, 3: rotation) with `variance * I`, and clears its
+/// correlations with the other block. Keeping cross terms that belong to a
+/// different (and possibly much larger) covariance would, in general, make the
+/// result indefinite.
+void replace_cov_block(mrpt::math::CMatrixDouble66& cov, int first, double variance)
+{
+    for (int i = first; i < first + 3; i++)
+    {
+        for (int j = 0; j < 6; j++)
+        {
+            cov(i, j) = 0;
+            cov(j, i) = 0;
+        }
+        cov(i, i) = variance;
+    }
+}
+
+/// Wheel-odometry increment with the uncertainty of the configured
+/// probabilistic motion model.
+mrpt::poses::CPose3DPDFGaussian odometry_increment_pdf(
+    const mola::state_estimation_smoother::Parameters& p,
+    const mrpt::poses::CPose2D&                        odometryIncrement)
+{
+    mrpt::obs::CActionRobotMovement2D odoAct;
+    auto&                             mm = odoAct.motionModelConfiguration;
+    mm.modelSelection                    = mrpt::obs::CActionRobotMovement2D::mmGaussian;
+    mm.gaussianModel.a1                  = p.odom_motion_model_a1;
+    mm.gaussianModel.a2                  = p.odom_motion_model_a2;
+    mm.gaussianModel.a3                  = p.odom_motion_model_a3;
+    mm.gaussianModel.a4                  = p.odom_motion_model_a4;
+    mm.gaussianModel.minStdXY            = p.odom_motion_model_min_std_xy;
+    mm.gaussianModel.minStdPHI           = mrpt::DEG2RAD(p.odom_motion_model_min_std_phi_deg);
+
+    odoAct.computeFromOdometry(odometryIncrement, mm);
+
+    mrpt::poses::CPose3DPDFGaussian incrementPdf;
+    incrementPdf.copyFrom(*odoAct.poseChange);
+    // Ensure as minimal uncertainty in all 3D DOFs to prevent numerical issues:
+    incrementPdf.cov.asEigen().diagonal().array() += 1e-4;
+    return incrementPdf;
 }
 
 }  // namespace
@@ -159,6 +350,75 @@ struct StateEstimationSmoother::GtsamImpl
 
     /** Queued for removal at the next update(). */
     gtsam::FactorIndices factorsToRemove;
+
+    /** A strong prior pinning a gauge freedom: a direction of the state that no
+     *  measurement observes yet, e.g. where {map} is before any source gives
+     *  poses in it. A weak prior would leave the system nearly singular, which
+     *  some GTSAM versions reject during Cholesky elimination. Anchors are only
+     *  placed on variables that are never marginalized, so they can always be
+     *  withdrawn once measurements start observing that direction.
+     */
+    struct GaugeAnchor
+    {
+        std::optional<size_t>             pendingIndex;  //!< Position in newFactors
+        std::optional<gtsam::FactorIndex> isamIndex;  //!< Once inside the smoother
+    };
+
+    /// Defines {map} as odometry frame `mapAnchorFrame` while no source observes {map}
+    std::optional<GaugeAnchor> mapAnchor;
+    odometry_frameid_t         mapAnchorFrame = 0;
+    bool                       mapObserved    = false;
+
+    /// Pins the azimuth of T_enu_to_map while no IMU attitude or GNSS observes it
+    std::optional<GaugeAnchor>   enuYawAnchor;
+    std::optional<gtsam::Point2> firstGnssEnuXY;
+
+    /// Queues a new anchor factor, built in place from `args`
+    template <class FACTOR, class... Args>
+    void add_anchor(std::optional<GaugeAnchor>& anchor, Args&&... args)
+    {
+        anchor = GaugeAnchor{newFactors.size(), std::nullopt};
+        newFactors.emplace_shared<FACTOR>(std::forward<Args>(args)...);
+    }
+
+    /// Drops the anchor, whether still pending or already inside the smoother
+    void withdraw_anchor(std::optional<GaugeAnchor>& anchor)
+    {
+        if (!anchor)
+        {
+            return;
+        }
+        if (anchor->pendingIndex)
+        {
+            const size_t idx = *anchor->pendingIndex;
+            newFactors.erase(newFactors.begin() + static_cast<std::ptrdiff_t>(idx));
+            for (auto* other : {&mapAnchor, &enuYawAnchor})
+            {
+                if (*other && (*other)->pendingIndex && *(*other)->pendingIndex > idx)
+                {
+                    --*(*other)->pendingIndex;
+                }
+            }
+        }
+        else if (anchor->isamIndex)
+        {
+            factorsToRemove.push_back(*anchor->isamIndex);
+        }
+        anchor.reset();
+    }
+
+    /// Records the iSAM2 index of anchors passed in the last update()
+    void on_update_done(const gtsam::FactorIndices& newFactorsIndices)
+    {
+        for (auto* anchor : {&mapAnchor, &enuYawAnchor})
+        {
+            if (*anchor && (*anchor)->pendingIndex)
+            {
+                (*anchor)->isamIndex = newFactorsIndices.at(*(*anchor)->pendingIndex);
+                (*anchor)->pendingIndex.reset();
+            }
+        }
+    }
 };
 
 // -------- StateEstimationSmoother::State -------
@@ -198,6 +458,16 @@ void StateEstimationSmoother::initialize(const mrpt::containers::yaml& cfg)
 
     // Load params:
     params_.loadFrom(cfg["params"]);
+
+#if !defined(MOLA_SMOOTHER_HAS_IMU_AVERAGER)
+    if (params_.imu_min_sample_period > 0)
+    {
+        MRPT_LOG_WARN(
+            "Built against a mola_imu_preintegration without ImuAverager: "
+            "imu_min_sample_period keeps one raw IMU reading per period instead of "
+            "averaging them, so platform vibration may alias into the IMU factors.");
+    }
+#endif
 
     if (auto vizMods = ExecutableBase::findService<mola::VizInterface>(); !vizMods.empty())
     {
@@ -274,6 +544,17 @@ void StateEstimationSmoother::reinitialize_gtsam_locked()
     state_.gtsam->newValues.insert(symbol_T_enu_to_map, enu2map);
     // Weak prior factor:
     state_.gtsam->newFactors.addPrior(symbol_T_enu_to_map, enu2map, enu2map_cov);
+
+    // Gravity alone observes its roll and pitch, never its azimuth:
+    if (!params_.fixed_geo_reference.has_value())
+    {
+        gtsam::Vector6 sigmas;
+        sigmas << ENU2MAP_WEAK_SIGMA, ENU2MAP_WEAK_SIGMA, GAUGE_ANCHOR_SIGMA, ENU2MAP_WEAK_SIGMA,
+            ENU2MAP_WEAK_SIGMA, ENU2MAP_WEAK_SIGMA;
+        state_.gtsam->add_anchor<gtsam::PriorFactor<gtsam::Pose3>>(
+            state_.gtsam->enuYawAnchor, symbol_T_enu_to_map, enu2map,
+            gtsam::noiseModel::Diagonal::Sigmas(sigmas));
+    }
 }
 
 #if defined(MOLA_KERNEL_NAVSTATE_FILTER_HAS_GEO_REFERENCE)
@@ -639,41 +920,154 @@ void StateEstimationSmoother::fuse_odometry_locked(
         // This is the first time we have wheels odometry.
         // Store the pose but skip factor creation: the increment is zero,
         // which would produce a stiff near-zero BetweenFactor.
+        //
+        // This reading also defines the origin of the accumulation below: at
+        // the very first sample no dead reckoning has happened yet, so the
+        // accumulated uncertainty is zero (T_map_to_odom absorbs wherever the
+        // source happens to start).
         state_.last_wheels_odometry_name  = odomName;
         state_.last_wheels_odometry       = odom.odometry;
         state_.last_wheels_odometry_stamp = odom.timestamp;
+        state_.wheels_odometry_accumulated.emplace();
+        state_.wheels_odometry_accumulated->mean = mrpt::poses::CPose3D(odom.odometry);
+        state_.wheels_odometry_accumulated->cov.setZero();
         return;
     }
     // Use a probabilistic motion model:
-    mrpt::obs::CActionRobotMovement2D odoAct;
-    odoAct.motionModelConfiguration.modelSelection = mrpt::obs::CActionRobotMovement2D::mmGaussian;
-    odoAct.motionModelConfiguration.gaussianModel.minStdXY  = 1e-3;
-    odoAct.motionModelConfiguration.gaussianModel.minStdPHI = mrpt::DEG2RAD(0.1);
+    const auto incrementPdf = odometry_increment_pdf(params_, odom.odometry - lastOdom);
 
-    const auto odometryIncrement = odom.odometry - lastOdom;
+    // Keep the absolute dead-reckoned pose in {odom_i} with its accumulated
+    // covariance. Motion enters the graph only as relative increments (see
+    // fuse_odometry_relative_locked()); this pose is used for the one factor
+    // resolving T_map_to_odom_i and as the source's own-frame pose that
+    // estimated_navstate() extrapolates from, and both need the uncertainty
+    // of the whole dead-reckoning history, not that of one increment.
+    ASSERT_(state_.wheels_odometry_accumulated.has_value());
+    *state_.wheels_odometry_accumulated = *state_.wheels_odometry_accumulated + incrementPdf;
 
-    odoAct.computeFromOdometry(odometryIncrement, odoAct.motionModelConfiguration);
+    // Take the mean from the source directly rather than from the composition:
+    // they agree analytically, and this keeps a long run free of accumulated
+    // round-off in a quantity the source reports exactly.
+    state_.wheels_odometry_accumulated->mean = mrpt::poses::CPose3D(odom.odometry);
 
-    mrpt::poses::CPose3DPDFGaussian newOdomPosePdf;
-    newOdomPosePdf.copyFrom(*odoAct.poseChange);
-    // Ensure as minimal uncertainty in all 3D DOFs to prevent numerical issues:
-    newOdomPosePdf.cov.asEigen().diagonal().array() += 1e-4;
-
-    // Convert probabilistic pose back to global "odom" frame for data fusion the in "odom" frame:
-    newOdomPosePdf.changeCoordinatesReference(mrpt::poses::CPose3D(lastOdom));
+    const mrpt::poses::CPose3DPDFGaussian& newOdomPosePdf = *state_.wheels_odometry_accumulated;
 
     MRPT_LOG_DEBUG_FMT(
-        "[fuse_odometry]: t=%f name=%s pose=%s poseChange=%s",
+        "[fuse_odometry]: t=%f name=%s pose=%s poseChange=%s accum_sigma_xy=%.03f m "
+        "accum_sigma_yaw=%.03f deg",
         mrpt::Clock::toDouble(odom.timestamp), odomName.c_str(), odom.odometry.asString().c_str(),
-        odoAct.poseChange->getMeanVal().asString().c_str());
+        incrementPdf.mean.asString().c_str(),
+        std::sqrt(newOdomPosePdf.cov(0, 0) + newOdomPosePdf.cov(1, 1)),
+        mrpt::RAD2DEG(std::sqrt(newOdomPosePdf.cov(5, 5))));
 
     // Save for next iteration (advance the anchor: this reading was kept):
     state_.last_wheels_odometry_name  = odomName;
     state_.last_wheels_odometry       = odom.odometry;
     state_.last_wheels_odometry_stamp = odom.timestamp;
 
-    // Fuse this new probabilistic pose observation:
-    fuse_pose_locked(odom.timestamp, newOdomPosePdf, odomName);
+    // Wheel odometry is always fused as relative increments: an absolute
+    // dead-reckoned pose asserts that the whole odometry trajectory relates to
+    // {map} by one rigid transform, which slip and scale errors break.
+    fuse_odometry_relative_locked(odom, odomName, newOdomPosePdf);
+}
+
+// Relative formulation: the motion goes into BetweenFactors between consecutive
+// odometry keyframes, and exactly ONE absolute pose-in-{odom_i} factor is ever
+// added, on the first kept reading of each source, to resolve T_map_to_odom_i.
+// It is the only formulation used for wheel odometry.
+//
+// One is all it takes, and it stays that way for the whole run. T_map_to_odom_i
+// is a single rigid variable: given that anchor plus the relative chain, every
+// later "keyframe k is at odom pose p_k" is already implied, up to the odometry
+// drift in between. A second absolute factor observes the frame no better -- it
+// re-injects the accumulated dead-reckoning error into the map poses.
+//
+// Nor does the anchor need renewing when its keyframe ages out. Keyframes leave
+// through IncrementalFixedLagSmoother's MARGINALIZATION, not through
+// factorsToRemove (which this class uses only for kinematic-link splicing), so
+// the anchor's information survives as a linear marginal on T_map_to_odom_i
+// after its keyframe is gone. Re-anchoring per window would therefore add
+// information the graph has already kept: the same double count, only slower.
+// T_map_to_odom_i itself is never marginalized -- its key timestamp is bumped to
+// the newest observation on every update, so it stays inside the lag forever.
+void StateEstimationSmoother::fuse_odometry_relative_locked(
+    const mrpt::obs::CObservationOdometry& odom, const std::string& odomName,
+    const mrpt::poses::CPose3DPDFGaussian& absolutePoseInOdom)
+{
+    const auto frame_id_idx = add_or_get_odom_frame_id(odomName);
+    const auto this_kf_id   = create_or_get_keyframe_by_timestamp_locked(odom.timestamp);
+
+    // Unconditional, and independent of which factor is added below: this is the
+    // anchor estimated_navstate() extrapolates from when a front end asks for a
+    // pose in the source's OWN frame, so it has to track every kept reading.
+    state_.last_raw_pose_by_source[frame_id_idx] =
+        State::RawSourcePose{odom.timestamp, absolutePoseInOdom};
+
+    if (!state_.wheels_odometry_anchor_kf.has_value())
+    {
+        gtsam::Pose3   pose_out;
+        gtsam::Matrix6 cov_out;
+        mrpt::gtsam_wrappers::to_gtsam_se3_cov6(absolutePoseInOdom, pose_out, cov_out);
+
+        seed_odom_frame_locked(frame_id_idx, this_kf_id, absolutePoseInOdom.mean);
+        state_.gtsam->newFactors.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
+            symbol_T_map_to_odom_i_base + frame_id_idx, T(this_kf_id), pose_out,
+            gtsam::noiseModel::Gaussian::Covariance(cov_out));
+
+        state_.wheels_odometry_anchor_kf = this_kf_id;
+
+        MRPT_LOG_DEBUG_FMT(
+            "[fuse_odometry] odom frame '%s' anchored at KF %u", odomName.c_str(),
+            static_cast<unsigned>(this_kf_id));
+    }
+
+    // Several readings can land on one keyframe. The first of them represents
+    // that keyframe, both as the end of its incoming increment and as the start
+    // of its outgoing one; the later ones only move the source further, so the
+    // chain anchor is held and their motion goes into the next increment.
+    const auto prev = state_.last_wheels_odometry_kf;
+    if (prev.has_value() && *prev == this_kf_id)
+    {
+        return;
+    }
+
+    const auto prevOdom               = state_.last_wheels_odometry_at_kf;
+    state_.last_wheels_odometry_kf    = this_kf_id;
+    state_.last_wheels_odometry_at_kf = odom.odometry;
+
+    if (!prev.has_value() || !prevOdom.has_value())
+    {
+        return;  // first reading of the chain
+    }
+
+    // The previous keyframe may have been marginalized out of the sliding window
+    // (a long gap in the stream, or a reset in between). Unlike the anchor above,
+    // whose information the marginalization keeps, a NEW factor naming a
+    // marginalized variable would resurrect it as a free, unconstrained state --
+    // so skip it and let the chain continue from here.
+    if (state_.last_estimated_states.count(*prev) == 0)
+    {
+        MRPT_LOG_THROTTLE_DEBUG_FMT(
+            5.0,
+            "[fuse_odometry] relative factor skipped: KF %u is no longer in the window; "
+            "the odometry chain continues from KF %u",
+            static_cast<unsigned>(*prev), static_cast<unsigned>(this_kf_id));
+        return;
+    }
+
+    // A relative transform is the same quantity in {map} and in {odom_i}: the
+    // two chains differ by one constant rigid T_map_to_odom_i, which cancels in
+    // T_prev^-1 * T_now. So the motion model's increment over the span between
+    // both keyframes is directly the measurement this factor needs, with
+    // directly the covariance it computes.
+    const auto increment = odometry_increment_pdf(params_, odom.odometry - *prevOdom);
+
+    gtsam::Pose3   incr_out;
+    gtsam::Matrix6 incrCov_out;
+    mrpt::gtsam_wrappers::to_gtsam_se3_cov6(increment, incr_out, incrCov_out);
+
+    state_.gtsam->newFactors.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
+        T(*prev), T(this_kf_id), incr_out, gtsam::noiseModel::Gaussian::Covariance(incrCov_out));
 }
 
 void StateEstimationSmoother::fuse_imu(const mrpt::obs::CObservationIMU& imu)
@@ -689,37 +1083,40 @@ void StateEstimationSmoother::fuse_imu(const mrpt::obs::CObservationIMU& imu)
     fuse_imu_locked(imu);
 }
 
-void StateEstimationSmoother::fuse_imu_locked(const mrpt::obs::CObservationIMU& imu)
+void StateEstimationSmoother::fuse_imu_locked(const mrpt::obs::CObservationIMU& rawImu)
 {
     // Ignore an IMU reading with no usable content up front, before touching the
     // decimation stamp or creating a keyframe: otherwise an empty sample would
     // consume the decimation interval (skipping the next, useful one) and add a
     // factor-less keyframe.
-    const bool hasAttitude = imu.has(mrpt::obs::IMU_ORI_QUAT_W);
+    const bool hasAttitude = rawImu.has(mrpt::obs::IMU_ORI_QUAT_W);
     const bool hasGravity =
-        imu.has(mrpt::obs::IMU_X_ACC) && params_.imu_normalized_gravity_alignment_sigma > 0;
-    const bool hasAngularVelocity = imu.has(mrpt::obs::IMU_WX) && imu.has(mrpt::obs::IMU_WY) &&
-                                    imu.has(mrpt::obs::IMU_WZ) &&
-                                    params_.imu_angular_velocity_sigma > 0;
-    if (!hasAttitude && !hasGravity && !hasAngularVelocity)
+        rawImu.has(mrpt::obs::IMU_X_ACC) && params_.imu_normalized_gravity_alignment_sigma > 0;
+    const auto hasAngularVelocity = [this](const mrpt::obs::CObservationIMU& o)
+    {
+        return o.has(mrpt::obs::IMU_WX) && o.has(mrpt::obs::IMU_WY) && o.has(mrpt::obs::IMU_WZ) &&
+               params_.imu_angular_velocity_sigma > 0;
+    };
+    if (!hasAttitude && !hasGravity && !hasAngularVelocity(rawImu))
     {
         return;
     }
 
-    // High-rate decimation: skip IMU readings arriving too soon after the last
-    // processed one. IMU attitude/gravity are absolute observations, so dropping
-    // intermediate readings just lowers the redundant-factor rate (unlike wheel
-    // odometry, there is no increment to accumulate).
-    if (params_.imu_min_sample_period > 0 && state_.last_processed_imu_stamp.has_value())
+    // High-rate decimation: fuse one reading per imu_min_sample_period, the
+    // average of all readings in that period. Keeping one raw reading instead
+    // would alias vibration (motors, propellers) into the factors below.
+    if (!state_.imu_decimator)
     {
-        const double dt =
-            mrpt::system::timeDifference(*state_.last_processed_imu_stamp, imu.timestamp);
-        if (dt < params_.imu_min_sample_period)
-        {
-            return;
-        }
+        state_.imu_decimator = std::make_shared<ImuDecimator>();
     }
-    state_.last_processed_imu_stamp = imu.timestamp;
+    const auto decimated = state_.imu_decimator->add(rawImu, params_.imu_min_sample_period);
+    if (!decimated)
+    {
+        return;
+    }
+    const mrpt::obs::CObservationIMU& imu = *decimated;
+    // From the fused reading: an average can carry channels its newest reading lacks.
+    const bool fuseAngularVelocity = hasAngularVelocity(imu);
 
     // Create a new KF id (or reuse a very close match):
     const auto this_kf_id = create_or_get_keyframe_by_timestamp_locked(
@@ -759,6 +1156,14 @@ void StateEstimationSmoother::fuse_imu_locked(const mrpt::obs::CObservationIMU& 
             state_.gtsam->newFactors.emplace_shared<mola::factors::Pose3RotationFactor>(
                 symbol_T_enu_to_map, T(this_kf_id), sensorOnVehicle, measuredRotation,
                 rotationNoise);
+
+            // Absolute attitude observes the azimuth of T_enu_to_map, and through
+            // a fixed one, the orientation of {map}:
+            state_.gtsam->withdraw_anchor(state_.gtsam->enuYawAnchor);
+            if (params_.fixed_geo_reference.has_value())
+            {
+                mark_map_observed_locked();
+            }
         }
     }
 
@@ -791,7 +1196,7 @@ void StateEstimationSmoother::fuse_imu_locked(const mrpt::obs::CObservationIMU& 
     // body-frame angular-velocity variable, so a genuine, fast rotation is represented
     // in the graph immediately instead of only through the constant-velocity kinematic
     // factor between keyframes (see imu_angular_velocity_sigma's docstring).
-    if (hasAngularVelocity)
+    if (fuseAngularVelocity)
     {
         const gtsam::Vector3 measuredW_sensor = {
             imu.get(mrpt::obs::IMU_WX), imu.get(mrpt::obs::IMU_WY), imu.get(mrpt::obs::IMU_WZ)};
@@ -920,6 +1325,34 @@ void StateEstimationSmoother::fuse_gnss_locked(const mrpt::obs::CObservationGPS&
 
     state_.gtsam->newFactors.emplace_shared<mola::factors::FactorGnssMapEnu>(
         symbol_T_enu_to_map, T(this_kf_id), sensorOnVehicle, observedEnu, enuNoiseModel);
+
+    // Through a fixed T_enu_to_map, GNSS observes where {map} is:
+    if (params_.fixed_geo_reference.has_value())
+    {
+        mark_map_observed_locked();
+    }
+
+    // The azimuth of T_enu_to_map becomes observable only once the fixes span a
+    // horizontal baseline long enough for the configured convergence accuracy:
+    if (state_.gtsam->enuYawAnchor)
+    {
+        const gtsam::Point2 xy(ENU_point.x, ENU_point.y);
+        if (!state_.gtsam->firstGnssEnuXY)
+        {
+            state_.gtsam->firstGnssEnuXY = xy;
+        }
+        else
+        {
+            const auto&  cov         = *gps.covariance_enu;
+            const double sigmaXY     = std::sqrt(std::max(cov(0, 0), cov(1, 1)));
+            const double minBaseline = std::sqrt(2.0) * sigmaXY /
+                                       mrpt::DEG2RAD(params_.convergence_max_orientation_sigma_deg);
+            if ((xy - *state_.gtsam->firstGnssEnuXY).norm() >= minBaseline)
+            {
+                state_.gtsam->withdraw_anchor(state_.gtsam->enuYawAnchor);
+            }
+        }
+    }
 }
 
 void StateEstimationSmoother::fuse_pose(
@@ -945,18 +1378,6 @@ void StateEstimationSmoother::fuse_pose_locked(
     // get this numerical frame_id :
     const auto frame_id_idx = add_or_get_odom_frame_id(frame_id);
 
-    // Create a new KF id (or reuse a very close match):
-    const auto this_kf_id = create_or_get_keyframe_by_timestamp_locked(timestamp);
-
-    MRPT_LOG_DEBUG_FMT(
-        "[fuse_pose]: kf_idx=%zu t=%f frame='%s' (idx=%zu) p=%s sigmas=%.02e %.02e %.02e (m) %.02e "
-        "%.02e %.02e (deg)",
-        static_cast<std::size_t>(this_kf_id), mrpt::Clock::toDouble(timestamp), frame_id.c_str(),
-        static_cast<std::size_t>(frame_id_idx), pose.mean.asString().c_str(),
-        std::sqrt(pose.cov(0, 0)), std::sqrt(pose.cov(1, 1)), std::sqrt(pose.cov(2, 2)),
-        mrpt::RAD2DEG(std::sqrt(pose.cov(3, 3))), mrpt::RAD2DEG(std::sqrt(pose.cov(4, 4))),
-        mrpt::RAD2DEG(std::sqrt(pose.cov(5, 5))));
-
     // numerical sanity: replace zero-variance entries (common in
     // nav_msgs/Odometry messages with unfilled covariance) with a
     // reasonable default so the factor graph remains well-conditioned.
@@ -981,26 +1402,198 @@ void StateEstimationSmoother::fuse_pose_locked(
             frame_id.c_str());
     }
 
+    // High-rate decimation: drop this reading if it arrives too soon after the
+    // last kept one of the same source. Done BEFORE the keyframe is created, so
+    // a dropped reading costs nothing and, under the relative formulation,
+    // leaves the source's chain tail where it was: the next kept reading then
+    // asserts the whole merged span as one increment, losing no motion.
+    if (params_.pose_min_sample_period > 0)
+    {
+        if (auto it = state_.last_kept_pose_stamp.find(frame_id_idx);
+            it != state_.last_kept_pose_stamp.end())
+        {
+            const double dt = mrpt::system::timeDifference(it->second, timestamp);
+            if (dt < params_.pose_min_sample_period)
+            {
+                // Not fused, but still the freshest pose of this source in its
+                // own frame, which is what the frame-local estimated_navstate()
+                // extrapolates from.
+                if (frame_id_idx != REFERENCE_FRAME_ID)
+                {
+                    auto itRaw = state_.last_raw_pose_by_source.find(frame_id_idx);
+                    if (itRaw != state_.last_raw_pose_by_source.end() &&
+                        timestamp > itRaw->second.stamp)
+                    {
+                        itRaw->second = State::RawSourcePose{timestamp, poseSanitized};
+                    }
+                }
+                return;
+            }
+        }
+        state_.last_kept_pose_stamp[frame_id_idx] = timestamp;
+    }
+
+    // Create a new KF id (or reuse a very close match):
+    const auto this_kf_id = create_or_get_keyframe_by_timestamp_locked(timestamp);
+
+    MRPT_LOG_DEBUG_FMT(
+        "[fuse_pose]: kf_idx=%zu t=%f frame='%s' (idx=%zu) p=%s sigmas=%.02e %.02e %.02e (m) %.02e "
+        "%.02e %.02e (deg)",
+        static_cast<std::size_t>(this_kf_id), mrpt::Clock::toDouble(timestamp), frame_id.c_str(),
+        static_cast<std::size_t>(frame_id_idx), pose.mean.asString().c_str(),
+        std::sqrt(pose.cov(0, 0)), std::sqrt(pose.cov(1, 1)), std::sqrt(pose.cov(2, 2)),
+        mrpt::RAD2DEG(std::sqrt(pose.cov(3, 3))), mrpt::RAD2DEG(std::sqrt(pose.cov(4, 4))),
+        mrpt::RAD2DEG(std::sqrt(pose.cov(5, 5))));
+
     // Add factor:
     gtsam::Pose3   pose_out;
     gtsam::Matrix6 cov_out;
     mrpt::gtsam_wrappers::to_gtsam_se3_cov6(poseSanitized, pose_out, cov_out);
 
-    // TODO: robust factors here?
-
     // reference frame ("map") or "odom_i"?
     if (frame_id_idx == REFERENCE_FRAME_ID)
     {
         // ref is "map":
+        mark_map_observed_locked();
         state_.gtsam->newFactors.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
-            T(this_kf_id), pose_out, gtsam::noiseModel::Gaussian::Covariance(cov_out));
+            T(this_kf_id), pose_out,
+            with_huber(
+                gtsam::noiseModel::Gaussian::Covariance(cov_out),
+                params_.pose_robust_huber_threshold));
+    }
+    else if (
+        !params_.relative_factors_frame_ids_re.empty() &&
+        std::regex_match(
+            frame_id,
+            state_.relative_factors_frame_ids_re.get_regex(params_.relative_factors_frame_ids_re)))
+    {
+        // Relative formulation, for a source that DRIFTS: assert only the
+        // increment between consecutive readings, plus one absolute factor
+        // added once to resolve T_map_to_odom_i. Mirrors
+        // fuse_odometry_relative_locked(), generalized to any fuse_pose()
+        // source. See Parameters::relative_factors_frame_ids_re.
+        auto& chain = state_.relative_pose_chains[frame_id_idx];
+
+        // Only strictly newer readings may extend the chain: an out-of-order or
+        // repeated sample would otherwise rewind the tail, and the next fresh
+        // reading would then assert the whole rewound span as ONE increment,
+        // with a one-increment covariance.
+        if (chain.last_stamp.has_value() && timestamp <= *chain.last_stamp)
+        {
+            MRPT_LOG_THROTTLE_WARN_FMT(
+                5.0,
+                "[fuse_pose] frame='%s': dropping non-monotonic reading (t=%f, chain tail t=%f)",
+                frame_id.c_str(), mrpt::Clock::toDouble(timestamp),
+                mrpt::Clock::toDouble(*chain.last_stamp));
+            return;
+        }
+
+        if (!chain.anchor_kf.has_value())
+        {
+            seed_odom_frame_locked(frame_id_idx, this_kf_id, poseSanitized.mean);
+            state_.gtsam->newFactors.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
+                symbol_T_map_to_odom_i_base + frame_id_idx, T(this_kf_id), pose_out,
+                gtsam::noiseModel::Gaussian::Covariance(cov_out));
+            chain.anchor_kf = this_kf_id;
+
+            MRPT_LOG_DEBUG_FMT(
+                "[fuse_pose] frame '%s' anchored at KF %u (relative formulation)", frame_id.c_str(),
+                static_cast<unsigned>(this_kf_id));
+        }
+
+        // A relative transform is the same quantity in {map} and in {odom_i}:
+        // the two chains differ by one constant rigid T_map_to_odom_i, which
+        // cancels in T_prev^-1 * T_now.
+        if (chain.last_kf.has_value() && chain.last_pose_in_odom.has_value() &&
+            *chain.last_kf != this_kf_id)
+        {
+            // A NEW factor naming a marginalized variable would resurrect it as
+            // a free, unconstrained state: skip it and continue the chain here.
+            if (state_.last_estimated_states.count(*chain.last_kf) == 0)
+            {
+                MRPT_LOG_THROTTLE_DEBUG_FMT(
+                    5.0,
+                    "[fuse_pose] relative factor skipped: KF %u is no longer in the window; "
+                    "the '%s' chain continues from KF %u",
+                    static_cast<unsigned>(*chain.last_kf), frame_id.c_str(),
+                    static_cast<unsigned>(this_kf_id));
+            }
+            else
+            {
+                mrpt::poses::CPose3DPDFGaussian increment;
+                increment.mean = poseSanitized.mean - chain.last_pose_in_odom->mean;
+                // In this mode the caller's covariance describes ONE increment.
+                increment.cov = poseSanitized.cov;
+
+                // A drifting source usually publishes the covariance of its
+                // absolute dead-reckoned pose, which says nothing about one
+                // increment. Assert the known per-increment accuracy instead,
+                // when the caller has configured one.
+                // Slips and skids are independent events along the path, so
+                // the variance of a dead-reckoned increment grows linearly
+                // with its size (a random walk). Unlike a sigma proportional
+                // to the size, this gives the same total variance however the
+                // path is split into increments, i.e. whatever the keyframe
+                // rate or pose_min_sample_period. The flat value is the floor
+                // asserted while standing still.
+                const double dL = increment.mean.translation().norm();
+                const double dA =
+                    mrpt::poses::Lie::SO<3>::log(increment.mean.getRotationMatrix()).norm();
+
+                const double sigmaLin0 = params_.relative_pose_increment_sigma_lin;
+                const double kLin      = params_.relative_pose_increment_sigma_per_sqrt_meter;
+                if (sigmaLin0 > 0)
+                {
+                    replace_cov_block(
+                        increment.cov, 0, mrpt::square(sigmaLin0) + mrpt::square(kLin) * dL);
+                }
+                const double sigmaAng0 = params_.relative_pose_increment_sigma_ang;
+                const double kAng      = params_.relative_pose_increment_sigma_per_sqrt_rad;
+                if (sigmaAng0 > 0)
+                {
+                    replace_cov_block(
+                        increment.cov, 3, mrpt::square(sigmaAng0) + mrpt::square(kAng) * dA);
+                }
+
+                gtsam::Pose3   incr_out;
+                gtsam::Matrix6 incrCov_out;
+                mrpt::gtsam_wrappers::to_gtsam_se3_cov6(increment, incr_out, incrCov_out);
+
+                state_.gtsam->newFactors.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
+                    T(*chain.last_kf), T(this_kf_id), incr_out,
+                    with_huber(
+                        gtsam::noiseModel::Gaussian::Covariance(incrCov_out),
+                        params_.pose_robust_huber_threshold));
+            }
+        }
+
+        // Advance the chain's measurement anchor ONLY when the keyframe
+        // actually changed. Several readings can land on the same keyframe
+        // (min_time_difference_to_create_new_frame merges near-simultaneous
+        // ones), and no factor is created for those; moving the anchor anyway
+        // would leave the motion between the first and last of them out of
+        // every increment, so the chain would report less motion than the
+        // source measured. Holding the anchor makes the next increment span
+        // the whole keyframe-to-keyframe interval.
+        if (!chain.last_kf.has_value() || *chain.last_kf != this_kf_id)
+        {
+            chain.last_kf           = this_kf_id;
+            chain.last_pose_in_odom = poseSanitized;
+        }
+        chain.last_stamp = timestamp;
+
+        state_.last_raw_pose_by_source[frame_id_idx] =
+            State::RawSourcePose{timestamp, poseSanitized};
     }
     else
     {
         // ref is an odometry frame:
+        seed_odom_frame_locked(frame_id_idx, this_kf_id, poseSanitized.mean);
         state_.gtsam->newFactors.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
             symbol_T_map_to_odom_i_base + frame_id_idx, T(this_kf_id), pose_out,
-            gtsam::noiseModel::Gaussian::Covariance(cov_out));
+            with_huber(
+                gtsam::noiseModel::Gaussian::Covariance(cov_out),
+                params_.pose_robust_huber_threshold));
 
         // Remember this source's own last raw pose (in {odom_i}), the anchor
         // estimated_navstate() extrapolates from to keep the short-term
@@ -1089,7 +1682,18 @@ std::optional<NavState> StateEstimationSmoother::estimated_navstate(
     // a solve or taking stateMutex_ (the backend thread may be holding it).
     if (params_.async_backend)
     {
-        return fastPredictor_->predict(timestamp, frame_id, params_);
+        mrpt::Clock::time_point anchorStamp;
+        auto ret = fastPredictor_->predict(timestamp, frame_id, params_, &anchorStamp);
+        if (ret.has_value())
+        {
+            // Extrapolation interval, i.e. how far behind the query the backend's
+            // last completed solve sits. In this path it is a function of host
+            // load, not of the data. Taken from the very snapshot this prediction
+            // used, not from a second snapshot() call that could race the backend.
+            navstate_dump_row(
+                timestamp, mrpt::system::timeDifference(anchorStamp, timestamp), *ret);
+        }
+        return ret;
     }
 
     auto lck = mrpt::lockHelper(stateMutex_);
@@ -1201,8 +1805,11 @@ std::optional<NavState> StateEstimationSmoother::estimated_navstate(
             // forward with the configured kinematic model, propagating covariance.
             mrpt::poses::CPose3DPDFGaussian anchorPose;
             anchorPose.copyFrom(retKf.pose);
-            ret.pose.copyFrom(extrapolate_pose_pdf(
-                params_, anchorPose, ret.twist, anchorTwistCov, closestFrameDtSigned));
+            auto mapPdf = extrapolate_pose_pdf(
+                params_, anchorPose, ret.twist, anchorTwistCov, closestFrameDtSigned);
+            apply_pose_sigma_floor(params_, mapPdf);
+            ret.pose.copyFrom(mapPdf);
+            navstate_dump_row(timestamp, closestFrameDtSigned, ret);
             return ret;
         }
 
@@ -1240,7 +1847,13 @@ std::optional<NavState> StateEstimationSmoother::estimated_navstate(
             const auto mapPred = extrapolate_pose_pdf(
                 params_, anchorPose, ret.twist, anchorTwistCov, closestFrameDtSigned);
             // Transform the {map}-frame prediction into {odom_i}: pred (-) T_frame_wrt_map.
-            ret.pose.copyFrom(mapPred - itFrame->second);
+            // The floor goes on AFTER the conversion: it is a statement about the
+            // frame the caller asked for, and the composition mixes the angular
+            // block into the translation one through the lever arm.
+            auto framePdf = mapPred - itFrame->second;
+            apply_pose_sigma_floor(params_, framePdf);
+            ret.pose.copyFrom(framePdf);
+            navstate_dump_row(timestamp, closestFrameDtSigned, ret);
             return ret;
         }
 
@@ -1256,8 +1869,11 @@ std::optional<NavState> StateEstimationSmoother::estimated_navstate(
         // The anchor is the front end's own near-exact pose in {odom_i}, so
         // prediction uncertainty is dominated by the one-step extrapolation, not
         // the absolute {map}-frame keyframe covariance.
-        ret.pose.copyFrom(
-            extrapolate_pose_pdf(params_, rawAnchor.pose, ret.twist, anchorTwistCov, dtPred));
+        auto rawPdf =
+            extrapolate_pose_pdf(params_, rawAnchor.pose, ret.twist, anchorTwistCov, dtPred);
+        apply_pose_sigma_floor(params_, rawPdf);
+        ret.pose.copyFrom(rawPdf);
+        navstate_dump_row(timestamp, dtPred, ret);
 
         return ret;
     }
@@ -1269,6 +1885,70 @@ std::optional<NavState> StateEstimationSmoother::estimated_navstate(
             e.what());
         return {};
     }
+}
+
+std::optional<mrpt::poses::CPose3DInterpolator> StateEstimationSmoother::estimated_trajectory(
+    const mrpt::Clock::time_point& start_time, const mrpt::Clock::time_point& end_time,
+    const std::string& frame_id)
+{
+    if (!params_.keep_finalized_trajectory)
+    {
+        return {};
+    }
+    auto lck = mrpt::lockHelper(stateMutex_);
+
+    // The stored poses are keyframe poses in the reference frame. For an
+    // odometry frame they are converted with the LATEST estimate of
+    // T_frame_wrt_map, held constant over the whole trajectory: exact while the
+    // two frames coincide, which is the case of an offline odometry run, and
+    // the best available answer otherwise, since no per-keyframe anchor is kept.
+    std::optional<mrpt::poses::CPose3D> T_frame_wrt_map;
+    if (frame_id != params_.reference_frame_name)
+    {
+        const auto itId = state_.known_odom_frames.find_key(frame_id);
+        if (itId == state_.known_odom_frames.getDirectMap().end())
+        {
+            return {};
+        }
+        const auto itFrame = state_.last_estimated_frames.find(itId->second);
+        if (itFrame == state_.last_estimated_frames.end())
+        {
+            return {};
+        }
+        T_frame_wrt_map = itFrame->second.mean;
+    }
+
+    // Everything already marginalized out, plus what is still in the window at
+    // its current value, so the tail of an offline run is not lost.
+    mrpt::poses::CPose3DInterpolator ret;
+    const auto                       inRange = [&](const mrpt::Clock::time_point& t)
+    { return t >= start_time && t <= end_time; };
+
+    const auto toRequestedFrame = [&](const mrpt::poses::CPose3D& pInMap)
+    { return T_frame_wrt_map ? (pInMap - *T_frame_wrt_map).asTPose() : pInMap.asTPose(); };
+
+    for (const auto& [t, p] : finalizedTrajectory_)
+    {
+        if (inRange(t))
+        {
+            ret.insert(t, toRequestedFrame(mrpt::poses::CPose3D(p)));
+        }
+    }
+    for (const auto& [t, frame_idx] : state_.stamp2frame_index)
+    {
+        const auto it = state_.last_estimated_states.find(frame_idx);
+        if (it == state_.last_estimated_states.end() || !inRange(t))
+        {
+            continue;
+        }
+        ret.insert(t, toRequestedFrame(it->second.pose));
+    }
+
+    if (ret.empty())
+    {
+        return {};
+    }
+    return ret;
 }
 
 std::set<std::string> StateEstimationSmoother::known_odometry_frame_ids()
@@ -1326,6 +2006,34 @@ void StateEstimationSmoother::onNewObservation(const CObservation::ConstPtr& o)
     else if (auto obsPose = std::dynamic_pointer_cast<const mrpt::obs::CObservationRobotPose>(o);
              obsPose)
     {
+        // Same label filter the CObservationOdometry branch above uses (and
+        // that StateEstimationSimple already applies to this branch): without
+        // it, EVERY robot-pose observation reaching this module is fused,
+        // whatever it is.
+        if (!std::regex_match(
+                o->sensorLabel, state_.do_process_odometry_labels_re.get_regex(
+                                    params_.do_process_odometry_labels_re)))
+        {
+            MRPT_LOG_DEBUG_FMT(
+                "Skipping robot pose reading labeled '%s' for not passing regex",
+                o->sensorLabel.c_str());
+            return;
+        }
+
+        // MOLA's offline dataset sources publish the reference trajectory as a
+        // CObservationRobotPose labeled "ground_truth" (KITTI, KITTI-360,
+        // MulRan, Paris-Luco). Fusing it would silently make every accuracy
+        // number measured against that same trajectory meaningless, so it takes
+        // an explicit opt-in.
+        if (o->sensorLabel == "ground_truth" && !params_.fuse_ground_truth_label)
+        {
+            MRPT_LOG_ONCE_WARN(
+                "Ignoring observations labeled 'ground_truth': fusing a dataset's own reference "
+                "trajectory would invalidate any accuracy evaluation against it. Set "
+                "'fuse_ground_truth_label: true' if that is really what you want.");
+            return;
+        }
+
         auto sensedSensorPose = obsPose->pose;
         if (obsPose->sensorPose != mrpt::poses::CPose3D())
         {
@@ -1573,21 +2281,42 @@ void StateEstimationSmoother::delete_too_old_entries()
     // auto lck = mrpt::lockHelper(stateMutex_); // this is assumed to be acquired by caller
 
     // Remove really old entries in our bimap. GTSAM fixed lag handles removing actual factors.
-    const double newestTime =
-        mrpt::Clock::toDouble(state_.stamp2frame_index.getDirectMap().rbegin()->first);
-    const double minTime = newestTime - params_.sliding_window_length;
+    // Ages are measured against the newest stamp with timeDifference(), not by
+    // comparing two toDouble() values: see add_kinematic_factor_between() for
+    // why that helper cannot be used on a pre-UNIX-epoch timestamp. Through it,
+    // the oldest keyframes of a zero-based clock read as the NEWEST and were
+    // never pruned.
+    const auto& newestStamp = state_.stamp2frame_index.getDirectMap().rbegin()->first;
 
-    std::set<mrpt::Clock::time_point> stamps_to_erase;
-    std::set<frame_index_t>           ids_to_erase;
+    std::set<mrpt::Clock::time_point>                stamps_to_erase;
+    std::set<frame_index_t>                          ids_to_erase;
+    std::map<mrpt::Clock::time_point, frame_index_t> stamp2erasedFrame;
     for (const auto& [existing_t, frame_idx] : state_.stamp2frame_index)
     {
-        const double t_existing = mrpt::Clock::toDouble(existing_t);
-        if (t_existing < minTime)
+        if (mrpt::system::timeDifference(existing_t, newestStamp) > params_.sliding_window_length)
         {
             stamps_to_erase.insert(existing_t);
             ids_to_erase.insert(frame_idx);
+            stamp2erasedFrame[existing_t] = frame_idx;
         }
     }
+    // A keyframe leaving the window carries the last value the smoother wrote
+    // back for it, which is its final one: no future measurement can reach it
+    // any more. Record it before it is dropped, so an offline run can read the
+    // smoothed trajectory instead of the front end's registered poses.
+    if (params_.keep_finalized_trajectory)
+    {
+        for (const auto& [t_erase, frame_idx] : stamp2erasedFrame)
+        {
+            const auto it = state_.last_estimated_states.find(frame_idx);
+            if (it == state_.last_estimated_states.end())
+            {
+                continue;
+            }
+            finalizedTrajectory_.insert(t_erase, it->second.pose.asTPose());
+        }
+    }
+
     for (const auto& t_erase : stamps_to_erase)
     {
         state_.stamp2frame_index.erase_by_key(t_erase);
@@ -1712,8 +2441,9 @@ StateEstimationSmoother::frame_index_t
         add_kinematic_factor_between(newFrameIdx, idx_after);
     }
 
-    // Remove really old entries in our bimap. GTSAM fixed lag handles removing actual factors.
-    delete_too_old_entries();
+    // Pruning (and, with it, finalized-trajectory recording) is deferred to
+    // process_pending_gtsam_updates_locked(), once the solver has written back
+    // this batch's estimate: see delete_too_old_entries() for why.
 
     return newFrameIdx;
 }
@@ -1757,7 +2487,56 @@ StateEstimationSmoother::odometry_frameid_t StateEstimationSmoother::add_or_get_
         symbol_T_map_to_odom_i_base + newId, initFramePose,
         gtsam::noiseModel::Isotropic::Sigma(6, INIT_ODOM_FRAME_POSE_SIGMA));
 
+    // Until some source observes {map}, define it as this first odometry frame,
+    // which is also where the weak prior above would leave it:
+    if (!state_.gtsam->mapObserved && !state_.gtsam->mapAnchor &&
+        !params_.link_first_pose_to_reference_origin_sigma.has_value())
+    {
+        state_.gtsam->add_anchor<gtsam::PriorFactor<gtsam::Pose3>>(
+            state_.gtsam->mapAnchor, symbol_T_map_to_odom_i_base + newId, initFramePose,
+            gtsam::noiseModel::Isotropic::Sigma(6, GAUGE_ANCHOR_SIGMA));
+        state_.gtsam->mapAnchorFrame = newId;
+    }
+
     return newId;
+}
+
+void StateEstimationSmoother::mark_map_observed_locked()
+{
+    state_.gtsam->mapObserved = true;
+    state_.gtsam->withdraw_anchor(state_.gtsam->mapAnchor);
+}
+
+// The identity initial value set above can be arbitrarily far from the truth
+// (an odometry frame may start anywhere in {map}). iSAM2 takes only one
+// Gauss-Newton step per update, so a poor linearization point may diverge.
+void StateEstimationSmoother::seed_odom_frame_locked(
+    odometry_frameid_t frame_id_idx, frame_index_t kf, const mrpt::poses::CPose3D& poseInOdom)
+{
+    const auto key = symbol_T_map_to_odom_i_base + frame_id_idx;
+    if (!state_.gtsam->newValues.exists(key))
+    {
+        return;  // Already in the smoother
+    }
+    const auto it = state_.last_estimated_states.find(kf);
+    if (it == state_.last_estimated_states.end())
+    {
+        return;
+    }
+
+    // While {map} is this very frame, the reading is the keyframe pose itself:
+    if (state_.gtsam->mapAnchor && state_.gtsam->mapAnchorFrame == frame_id_idx)
+    {
+        if (state_.gtsam->newValues.exists(T(kf)))
+        {
+            state_.gtsam->newValues.update(T(kf), mrpt::gtsam_wrappers::toPose3(poseInOdom));
+            it->second.pose = poseInOdom;
+        }
+        return;
+    }
+
+    const auto T_map_to_odom = it->second.pose + (-poseInOdom);
+    state_.gtsam->newValues.update(key, mrpt::gtsam_wrappers::toPose3(T_map_to_odom));
 }
 
 void StateEstimationSmoother::process_pending_gtsam_updates()
@@ -1770,10 +2549,31 @@ void StateEstimationSmoother::process_pending_gtsam_updates_locked()
 {
     const auto tle = mola::ProfilerEntry(profiler_, "process_pending_gtsam_updates");
 
+    // Until some source relates {map} to the vehicle (e.g. while IMU readings
+    // arrive ahead of the first pose), its position and heading are held only
+    // by weak priors, which some GTSAM versions refuse to factorize. Wait for
+    // one, for up to a window length so that the pending data stays bounded.
+    if (!state_.gtsam->mapObserved && !state_.gtsam->mapAnchor &&
+        !params_.link_first_pose_to_reference_origin_sigma.has_value() &&
+        state_.gtsam->smoother->timestamps().empty())
+    {
+        double oldestStamp = std::numeric_limits<double>::infinity();
+        double newestStamp = -std::numeric_limits<double>::infinity();
+        for (const auto& [_, stamp] : state_.gtsam->newKeyStamps)
+        {
+            oldestStamp = std::min(oldestStamp, stamp);
+            newestStamp = std::max(newestStamp, stamp);
+        }
+        if (newestStamp - oldestStamp < params_.sliding_window_length)
+        {
+            return;
+        }
+    }
+
     // Even if we have no new factors/values, do update the stamps of "persistent" variables:
     if (state_.last_observation_stamp.has_value())
     {
-        const auto lastObservationStamp_sec = mrpt::Clock::toDouble(*state_.last_observation_stamp);
+        const auto lastObservationStamp_sec = key_stamp_seconds(*state_.last_observation_stamp);
 
         state_.gtsam->newKeyStamps[symbol_T_enu_to_map] = lastObservationStamp_sec;
         for (const auto& [_, frameId] : state_.known_odom_frames)
@@ -1794,6 +2594,29 @@ void StateEstimationSmoother::process_pending_gtsam_updates_locked()
     }
 
     auto& smoother = *state_.gtsam->smoother;
+
+    // A key must not leave the lag window in the same update that inserts it:
+    // some GTSAM versions look marginalizable keys up in the Bayes tree before
+    // adding the new ones, and throw. Keep such a key until the next update.
+    {
+        double newestStamp = -std::numeric_limits<double>::infinity();
+        for (const auto& [_, stamp] : smoother.timestamps())
+        {
+            newestStamp = std::max(newestStamp, stamp);
+        }
+        for (const auto& [_, stamp] : state_.gtsam->newKeyStamps)
+        {
+            newestStamp = std::max(newestStamp, stamp);
+        }
+        const double oldestKept = newestStamp - params_.sliding_window_length;
+        for (auto& [key, stamp] : state_.gtsam->newKeyStamps)
+        {
+            if (stamp < oldestKept && !smoother.getLinearizationPoint().exists(key))
+            {
+                stamp = oldestKept;
+            }
+        }
+    }
 
     // Flush the per-link kinematic factors into newFactors, remembering the range
     // each link occupies so its iSAM2 indices can be recovered below.
@@ -1833,6 +2656,7 @@ void StateEstimationSmoother::process_pending_gtsam_updates_locked()
                 }
                 state_.gtsam->flushedKinematic[linkKey] = indices;
             }
+            state_.gtsam->on_update_done(newIdx);
             state_.gtsam->factorsToRemove.clear();
         }
 
@@ -1947,6 +2771,25 @@ void StateEstimationSmoother::process_pending_gtsam_updates_locked()
         const auto tleWriteback = mola::ProfilerEntry(profiler_, "process_pending.writeback");
         for (auto& [kfIdx, kf] : state_.last_estimated_states)
         {
+            // This is a FIXED-LAG smoother: once a keyframe leaves the lag
+            // window it is marginalized out, and its T/V/W variables leave
+            // optValues with it. Reading them unconditionally threw
+            // "Attempting to at the key tNNN, which does not exist in the
+            // Values", and since the caller treats that as fatal, the whole
+            // run stopped mid-sequence and discarded every later
+            // observation. Seen on Newer College 2020 (t3478, ~14% in) and
+            // on GEODE Offroad1_gamma (t335, ~7.5% in).
+            //
+            // Skipping is the right behavior rather than merely the safe
+            // one: such an entry already holds the last estimate the
+            // smoother produced for it before marginalizing, which IS that
+            // keyframe's final value. There is nothing newer to write.
+            if (!optValues.exists(T(kfIdx)) || !optValues.exists(V(kfIdx)) ||
+                !optValues.exists(W(kfIdx)))
+            {
+                continue;
+            }
+
             const auto pose = optValues.at<gtsam::Pose3>(T(kfIdx));
             const auto linV = optValues.at<gtsam::Vector3>(V(kfIdx));
             const auto angV = optValues.at<gtsam::Vector3>(W(kfIdx));
@@ -1960,6 +2803,17 @@ void StateEstimationSmoother::process_pending_gtsam_updates_locked()
                 enforce_planar_twist(kf.twist);
             }
         }
+    }
+
+    // Age out keyframes that fell outside the window, now that the writeback
+    // above has given every one of them its final solved value. Done here,
+    // once per batch, rather than per fuse_*() call: in async mode several
+    // keyframes can be created before this function next runs, and finalizing
+    // one on creation would record a stale (or altogether missing) pose
+    // instead of this batch's solve.
+    if (!state_.stamp2frame_index.empty())
+    {
+        delete_too_old_entries();
     }
 
     // Drive the predict-twist low-pass with the newest keyframe's optimized
@@ -2048,7 +2902,9 @@ void StateEstimationSmoother::process_pending_gtsam_updates_locked()
                 mrpt::RAD2DEG(em_ori_sigma_roll), params_.convergence_max_position_sigma,
                 params_.convergence_max_orientation_sigma_deg);
 
-            if (converged && state_.tentative_geo_coord_reference.has_value())
+            // While pinned by its anchor, the azimuth sigma says nothing about the data:
+            if (converged && state_.tentative_geo_coord_reference.has_value() &&
+                !state_.gtsam->enuYawAnchor)
             {
                 state_.geo_reference.emplace();
                 state_.geo_reference->geo_coord    = state_.tentative_geo_coord_reference.value();
@@ -2062,6 +2918,45 @@ void StateEstimationSmoother::process_pending_gtsam_updates_locked()
     {
         const auto tleOdomMarg =
             mola::ProfilerEntry(profiler_, "process_pending.marginals.odom_frames");
+        // A source fused as relative increments constrains its T_map_to_odom_i
+        // only through the one anchor factor, so that variable keeps the
+        // initial alignment while the source drifts away from it. The live
+        // map->odom of such a source is the correction that makes it agree
+        // with the fused pose at the tail keyframe of its chain.
+        const auto liveRelativeFrame =
+            [this](odometry_frameid_t idx) -> std::optional<mrpt::poses::CPose3D>
+        {
+            std::optional<frame_index_t>        tailKf;
+            std::optional<mrpt::poses::CPose3D> tailPoseInOdom;
+            if (const auto it = state_.relative_pose_chains.find(idx);
+                it != state_.relative_pose_chains.end() && it->second.last_pose_in_odom)
+            {
+                tailKf         = it->second.last_kf;
+                tailPoseInOdom = it->second.last_pose_in_odom->mean;
+            }
+            else if (state_.last_wheels_odometry_name && state_.last_wheels_odometry_at_kf)
+            {
+                const auto itName =
+                    state_.known_odom_frames.find_key(*state_.last_wheels_odometry_name);
+                if (itName != state_.known_odom_frames.getDirectMap().end() &&
+                    itName->second == idx)
+                {
+                    tailKf         = state_.last_wheels_odometry_kf;
+                    tailPoseInOdom = mrpt::poses::CPose3D(*state_.last_wheels_odometry_at_kf);
+                }
+            }
+            if (!tailKf || !tailPoseInOdom)
+            {
+                return {};
+            }
+            const auto itKf = state_.last_estimated_states.find(*tailKf);
+            if (itKf == state_.last_estimated_states.end())
+            {
+                return {};
+            }
+            return itKf->second.pose + (-*tailPoseInOdom);
+        };
+
         for (const auto& [_, odomFrameIdx] : state_.known_odom_frames)
         {
             const auto symbolOdom        = symbol_T_map_to_odom_i_base + odomFrameIdx;
@@ -2070,8 +2965,10 @@ void StateEstimationSmoother::process_pending_gtsam_updates_locked()
 
             auto& pdf = state_.last_estimated_frames[odomFrameIdx];
 
-            pdf.mean = mrpt::poses::CPose3D(mrpt::gtsam_wrappers::toTPose3D(T_map2_odom_i));
-            pdf.cov  = mrpt::gtsam_wrappers::to_mrpt_se3_cov6(T_map2_odom_i_cov);
+            const auto live = liveRelativeFrame(odomFrameIdx);
+            pdf.mean =
+                live ? *live : mrpt::poses::CPose3D(mrpt::gtsam_wrappers::toTPose3D(T_map2_odom_i));
+            pdf.cov = mrpt::gtsam_wrappers::to_mrpt_se3_cov6(T_map2_odom_i_cov);
         }
     }
 
@@ -2235,7 +3132,7 @@ void StateEstimationSmoother::initialize_new_frame(
     frame_index_t id, const pair_nearby_frame_iterators_t& closestFrames)
 {
     const auto stamp   = state_.stamp2frame_index.find_value(id)->second;
-    const auto stamp_s = mrpt::Clock::toDouble(stamp);
+    const auto stamp_s = key_stamp_seconds(stamp);
 
     const auto closest_idx_opt = pick_closest(closestFrames, stamp);
 
@@ -2336,8 +3233,14 @@ void StateEstimationSmoother::add_kinematic_factor_between(
 
     // Dispatch to factor generation:
     // --------------------------------------------------------------------
-    const double dt = mrpt::Clock::toDouble(state_.stamp2frame_index.inverse(to)) -
-                      mrpt::Clock::toDouble(state_.stamp2frame_index.inverse(from));
+    // Elapsed time between the two keyframes, taken on the clock's own signed
+    // tick type. Never as a difference of mrpt::Clock::toDouble() values: that
+    // helper rebases onto the UNIX epoch with an UNSIGNED subtraction, so a
+    // timestamp even a millisecond before it wraps to ~1.8e12 s instead of a
+    // small negative number, and every difference taken through it is garbage.
+    // Datasets whose clock starts at zero do produce such timestamps.
+    const double dt = mrpt::system::timeDifference(
+        state_.stamp2frame_index.inverse(from), state_.stamp2frame_index.inverse(to));
 
     switch (params_.kinematic_model)
     {

@@ -46,6 +46,18 @@ namespace
 /// for a state, since any query or measurement drains everything older than
 /// its own timestamp.
 constexpr double kPendingImuMaxAge = 1.0;
+
+// Same role for buffered odometry. Generous: odometry sources run far slower
+// than an IMU, and dropping one silently loses a pose increment.
+constexpr double kPendingOdometryMaxAge = 5.0;
+
+/// Largest gap [s] between the ends of the queried interval and the nearest
+/// IMU reading for inertial propagation to still be used.
+constexpr double kImuPropagationMaxGap = 0.05;
+
+/// Extra age [s], beyond Parameters::imu_propagation_max_time, kept in the
+/// IMU history, so a query still finds the readings right after the last pose.
+constexpr double kImuHistoryMargin = 1.0;
 }  // namespace
 
 StateEstimationSimple::StateEstimationSimple() = default;
@@ -64,6 +76,8 @@ void StateEstimationSimple::initialize(const mrpt::containers::yaml& cfg)
 
     // Load params:
     params.loadFrom(cfg["params"]);
+
+    seedInitialTwistFromParams();
 
     // Initialize parent:
     mola::NavStateFilter::initialize(cfg);
@@ -84,14 +98,46 @@ void StateEstimationSimple::reset()
     // own timestamp covers. Discarding them here would instead make the
     // estimate depend on how many readings happened to be delivered before the
     // reset ran, i.e. on thread scheduling rather than on the input.
-    auto pendingImu = std::move(state_.pending_imu);
+    auto pendingImu  = std::move(state_.pending_imu);
+    auto pendingOdom = std::move(state_.pending_odometry);
+    auto imuHistory  = std::move(state_.imu_history);
 
     // reset:
     state_ = State();
 
-    state_.pending_imu = std::move(pendingImu);
+    state_.pending_imu      = std::move(pendingImu);
+    state_.pending_odometry = std::move(pendingOdom);
+    state_.imu_history      = std::move(imuHistory);
+
+    seedInitialTwistFromParams();
 
     MRPT_LOG_INFO_STREAM("reset() called");
+}
+
+void StateEstimationSimple::seedInitialTwistFromParams()
+{
+    if (params.initial_twist == mrpt::math::TTwist3D())
+    {
+        return;  // nothing configured, keep the legacy "unknown velocity" state
+    }
+
+    state_.last_twist = params.initial_twist;
+
+    auto&        cov     = state_.last_twist_cov.emplace();
+    const double var_lin = mrpt::square(params.initial_twist_sigma_lin);
+    const double var_ang = mrpt::square(params.initial_twist_sigma_ang);
+    cov.setZero();
+    for (int i = 0; i < 3; i++)
+    {
+        cov(i, i) = var_lin;
+    }
+    for (int i = 3; i < 6; i++)
+    {
+        cov(i, i) = var_ang;
+    }
+
+    state_.vel_filter_P      = {var_lin, var_lin, var_lin, var_ang, var_ang, var_ang};
+    state_.vel_filter_seeded = {true, true, true, true, true, true};
 }
 
 namespace
@@ -256,12 +302,33 @@ void StateEstimationSimple::update_vel_filter(
             continue;
         }
 
-        // Bootstrap this component on its first observation (or after a twist
-        // reset cleared the per-component clocks).
-        if (!state_.vel_filter_last_tim[i].has_value() || !state_.last_twist.has_value())
+        // True bootstrap: this component was neither seeded by
+        // params.initial_twist nor observed yet, so there is nothing to
+        // blend with. Checked per-component (not via state_.last_twist,
+        // which becomes non-empty as soon as ANY component is observed and
+        // would otherwise make sibling, still-unseeded components blend with
+        // an uninformative default instead of bootstrapping outright).
+        if (!state_.vel_filter_seeded[i] && !state_.vel_filter_last_tim[i].has_value())
         {
             v[i]                          = z[i];
             state_.vel_filter_P[i]        = R_diag[i];
+            state_.vel_filter_last_tim[i] = tim;
+            continue;
+        }
+
+        // Seeded (params.initial_twist) but never observed: blend this first
+        // real measurement with the seed via its own covariance instead of
+        // overwriting it outright. No process-noise growth is applied since
+        // the seed carries no observation time to measure its age from.
+        if (state_.vel_filter_seeded[i] && !state_.vel_filter_last_tim[i].has_value())
+        {
+            const double denom = state_.vel_filter_P[i] + R_diag[i];
+            if (denom > kEps)
+            {
+                const double K = state_.vel_filter_P[i] / denom;
+                v[i] += K * (z[i] - v[i]);
+                state_.vel_filter_P[i] *= (1.0 - K);
+            }
             state_.vel_filter_last_tim[i] = tim;
             continue;
         }
@@ -291,17 +358,40 @@ void StateEstimationSimple::update_vel_filter(
 }
 
 void StateEstimationSimple::fuse_odometry(
-    const mrpt::obs::CObservationOdometry& odom, [[maybe_unused]] const std::string& odomName)
+    const mrpt::obs::CObservationOdometry& odom, const std::string& odomName)
 {
     auto lck = std::scoped_lock(state_mtx_);
+    fuse_odometry_locked(odom, odomName);
+}
 
+void StateEstimationSimple::fuse_odometry_locked(
+    const mrpt::obs::CObservationOdometry& odom, [[maybe_unused]] const std::string& odomName)
+{
     fuse_pending_imu_up_to(odom.timestamp);
 
-    // Advance last_pose by the incremental 2D odometry delta:
+    // Advance last_pose by the incremental 2D odometry delta.
+    //
+    // The increment is a HORIZONTAL (x, y, yaw) displacement: CObservationOdometry
+    // carries a CPose2D, so whatever vertical motion the source saw is already
+    // gone by the time it arrives here. Right-composing it onto last_pose would
+    // apply that horizontal displacement along the body's own axes, so on a
+    // pitched platform part of it turns into vertical motion that never
+    // happened (on a 25 deg slope, ~42 % of every step becomes spurious z).
+    // Apply it in the yaw-only frame instead, and leave z, pitch and roll to
+    // the sources that actually observe them.
     if (state_.last_odom_obs && state_.last_pose)
     {
-        const auto poseIncr    = odom.odometry - state_.last_odom_obs->odometry;
-        state_.last_pose->mean = state_.last_pose->mean + mrpt::poses::CPose3D(poseIncr);
+        const auto poseIncr = odom.odometry - state_.last_odom_obs->odometry;
+
+        auto&        p   = state_.last_pose->mean;
+        const double yaw = p.yaw();
+        const double cy  = std::cos(yaw);
+        const double sy  = std::sin(yaw);
+
+        p.x(p.x() + cy * poseIncr.x() - sy * poseIncr.y());
+        p.y(p.y() + sy * poseIncr.x() + cy * poseIncr.y());
+        p.setYawPitchRoll(yaw + poseIncr.phi(), p.pitch(), p.roll());
+
         state_.pose_already_updated_with_odom = true;
     }
     state_.last_odom_obs = odom;
@@ -314,8 +404,8 @@ void StateEstimationSimple::fuse_odometry(
         // 2D odometry measures vx, vy, wz only. Pass large R for the
         // unmeasured components (vz, wx, wy) so the filter gain is ~0 for them.
         const double no_info = 1e9;
-        const double var_xyz = mrpt::square(0.1);  // [m²/s²]
-        const double var_rot = mrpt::square(0.05);  // [rad²/s²]
+        const double var_xyz = mrpt::square(params.sigma_wheel_odom_linear_vel);  // [m²/s²]
+        const double var_rot = mrpt::square(params.sigma_wheel_odom_angular_vel);  // [rad²/s²]
 
         const double cur_vz = state_.last_twist.has_value() ? state_.last_twist->vz : 0.0;
         const double cur_wx = state_.last_twist.has_value() ? state_.last_twist->wx : 0.0;
@@ -342,7 +432,12 @@ void StateEstimationSimple::fuse_odometry_3d_pose(
     const mrpt::obs::CObservationRobotPose& obs, const std::string& odomName)
 {
     auto lck = std::scoped_lock(state_mtx_);
+    fuse_odometry_3d_pose_locked(obs, odomName);
+}
 
+void StateEstimationSimple::fuse_odometry_3d_pose_locked(
+    const mrpt::obs::CObservationRobotPose& obs, const std::string& odomName)
+{
     fuse_pending_imu_up_to(obs.timestamp);
 
     // Apply sensor-to-base correction if the sensor is not at the origin:
@@ -352,7 +447,8 @@ void StateEstimationSimple::fuse_odometry_3d_pose(
         sensedPose = sensedPose + mrpt::poses::CPose3DPDFGaussian(-obs.sensorPose);
     }
 
-    auto& src = state_.per_source[odomName];
+    auto& src        = state_.per_source[odomName];
+    src.in_map_frame = false;
 
     // Compute and apply the incremental delta to last_pose, keeping it in the
     // LiDAR SLAM frame rather than replacing it with the absolute odom pose
@@ -385,10 +481,17 @@ void StateEstimationSimple::fuse_odometry_3d_pose(
         // last_pose has been set by LiDAR ICP.
         if (dt > 0 && dt < params.max_time_to_use_velocity_model)
         {
-            const auto   logRot  = mrpt::poses::Lie::SO<3>::log(delta.getRotationMatrix());
-            const double dt2     = dt * dt;
-            const double var_lin = mrpt::square(params.sigma_relative_pose_linear) / dt2;
-            const double var_ang = mrpt::square(params.sigma_relative_pose_angular) / dt2;
+            const auto logRot = mrpt::poses::Lie::SO<3>::log(delta.getRotationMatrix());
+
+            // Velocity uncertainty comes from sigma_wheel_odom_*, the same
+            // knobs the 2D path uses, and NOT from sigma_relative_pose_* / dt.
+            // The latter describes a pose from an independent, lower-rate
+            // source; dividing it by this source's own sampling period makes
+            // the reading meaningless as the rate goes up (at 20 Hz, 0.5 m
+            // becomes 10 m/s, so the filter gain is ~0 and a good odometry
+            // source contributes nothing to the twist).
+            const double var_lin = mrpt::square(params.sigma_wheel_odom_linear_vel);
+            const double var_ang = mrpt::square(params.sigma_wheel_odom_angular_vel);
 
             const std::array<double, 6> z = {
                 delta.x() / dt, delta.y() / dt, delta.z() / dt,
@@ -458,6 +561,25 @@ void StateEstimationSimple::fuse_imu(const mrpt::obs::CObservationIMU& imu)
     state_.pending_imu.emplace(
         imu.timestamp, State::PendingImu{imuReading.wx, imuReading.wy, imuReading.wz});
 
+    if (params.imu_propagation && imu.has(mrpt::obs::TIMUDataIndex::IMU_X_ACC) &&
+        imu.has(mrpt::obs::TIMUDataIndex::IMU_Y_ACC) &&
+        imu.has(mrpt::obs::TIMUDataIndex::IMU_Z_ACC))
+    {
+        const auto f = imu.sensorPose.rotateVector(
+            {imu.get(mrpt::obs::TIMUDataIndex::IMU_X_ACC),
+             imu.get(mrpt::obs::TIMUDataIndex::IMU_Y_ACC),
+             imu.get(mrpt::obs::TIMUDataIndex::IMU_Z_ACC)});
+        state_.imu_history.emplace(
+            imu.timestamp, State::ImuSample{{imuReading.wx, imuReading.wy, imuReading.wz}, f});
+
+        const auto oldest =
+            state_.imu_history.rbegin()->first -
+            std::chrono::duration_cast<mrpt::Clock::duration>(
+                std::chrono::duration<double>(params.imu_propagation_max_time + kImuHistoryMargin));
+        state_.imu_history.erase(
+            state_.imu_history.begin(), state_.imu_history.lower_bound(oldest));
+    }
+
     // Keep the buffer bounded in case nothing ever asks for an estimate:
     const auto oldestToKeep =
         state_.pending_imu.rbegin()->first - std::chrono::duration_cast<mrpt::Clock::duration>(
@@ -496,6 +618,178 @@ void StateEstimationSimple::fuse_pending_imu_up_to(const mrpt::Clock::time_point
     state_.pending_imu.erase(state_.pending_imu.begin(), itEnd);
 }
 
+std::optional<StateEstimationSimple::Integration> StateEstimationSimple::imu_integrate(
+    const mrpt::math::CMatrixDouble33& R0, const mrpt::math::TVector3D& v0,
+    const mrpt::Clock::time_point& t0, const mrpt::Clock::time_point& t1) const
+{
+    // The readings must cover the whole interval:
+    const auto itBegin = state_.imu_history.upper_bound(t0);
+    const auto itEnd   = state_.imu_history.upper_bound(t1);
+    if (itBegin == itEnd ||
+        mrpt::system::timeDifference(t0, itBegin->first) > kImuPropagationMaxGap ||
+        mrpt::system::timeDifference(std::prev(itEnd)->first, t1) > kImuPropagationMaxGap)
+    {
+        if (state_.imu_history.empty())
+        {
+            MRPT_LOG_THROTTLE_WARN(
+                30.0,
+                "imu_propagation is enabled but no IMU reading with accelerometer data has been "
+                "received: using the constant-twist model.");
+        }
+        else
+        {
+            MRPT_LOG_THROTTLE_DEBUG_FMT(
+                5.0,
+                "imu_propagation: IMU readings do not cover [%.3f, %.3f] (buffered: %.3f to "
+                "%.3f): using the constant-twist model.",
+                mrpt::Clock::toDouble(t0), mrpt::Clock::toDouble(t1),
+                mrpt::Clock::toDouble(state_.imu_history.begin()->first),
+                mrpt::Clock::toDouble(state_.imu_history.rbegin()->first));
+        }
+        return {};
+    }
+
+    mrpt::math::CMatrixDouble33 R = R0;
+    const Eigen::Vector3d       g(0, 0, -params.gravity_magnitude);
+    Eigen::Vector3d             v(v0.x, v0.y, v0.z);
+    Eigen::Vector3d             p = Eigen::Vector3d::Zero();
+
+    const mola::imu::ImuIntegrationParams noBias = {};
+
+    // Each reading is held from the previous stamp up to its own; the newest
+    // one also covers what is left up to t1.
+    auto step = [&](const State::ImuSample& s, double dt)
+    {
+        const Eigen::Vector3d a = R.asEigen() * Eigen::Vector3d(s.f.x, s.f.y, s.f.z) + g;
+        p += v * dt + 0.5 * a * dt * dt;
+        v += a * dt;
+        R = R * mola::imu::incremental_rotation({s.w.x, s.w.y, s.w.z}, noBias, dt);
+    };
+
+    auto tPrev = t0;
+    for (auto it = itBegin; it != itEnd; ++it)
+    {
+        step(it->second, mrpt::system::timeDifference(tPrev, it->first));
+        tPrev = it->first;
+    }
+    step(std::prev(itEnd)->second, mrpt::system::timeDifference(tPrev, t1));
+
+    Integration ret;
+    ret.displacement = {p.x(), p.y(), p.z()};
+    ret.velocity     = {v.x(), v.y(), v.z()};
+    ret.rotation     = R;
+    return ret;
+}
+
+std::optional<StateEstimationSimple::Propagation> StateEstimationSimple::imu_propagate(
+    const mrpt::Clock::time_point& timestamp) const
+{
+    if (!state_.last_pose || !state_.last_pose_obs_tim || !state_.imu_velocity ||
+        state_.imu_velocity_tim != state_.last_pose_obs_tim)
+    {
+        return {};
+    }
+
+    const auto R0 = state_.last_pose->mean.getRotationMatrix();
+    auto       in = imu_integrate(R0, *state_.imu_velocity, *state_.last_pose_obs_tim, timestamp);
+    if (!in)
+    {
+        return {};
+    }
+    // Remove the estimated acceleration bias, constant in the reference frame:
+    const double dt = mrpt::system::timeDifference(*state_.last_pose_obs_tim, timestamp);
+    in->displacement -= state_.imu_accel_bias * (0.5 * dt * dt);
+    in->velocity -= state_.imu_accel_bias * dt;
+
+    const Eigen::Matrix3d R0t = R0.asEigen().transpose();
+    const Eigen::Vector3d dp =
+        R0t * Eigen::Vector3d(in->displacement.x, in->displacement.y, in->displacement.z);
+    const mrpt::math::CMatrixDouble33 dR(Eigen::Matrix3d(R0t * in->rotation.asEigen()));
+
+    Propagation ret;
+    ret.increment = mrpt::poses::CPose3D::FromRotationAndTranslation(
+        dR, mrpt::math::TVector3D(dp.x(), dp.y(), dp.z()));
+    const Eigen::Vector3d vb = in->rotation.asEigen().transpose() *
+                               Eigen::Vector3d(in->velocity.x, in->velocity.y, in->velocity.z);
+    ret.velocity_body = {vb.x(), vb.y(), vb.z()};
+    return ret;
+}
+
+void StateEstimationSimple::update_imu_velocity(
+    const mrpt::poses::CPose3D& prevPose, const mrpt::Clock::time_point& prevTime,
+    const mrpt::poses::CPose3D& newPose, const mrpt::Clock::time_point& newTime)
+{
+    const double dt = mrpt::system::timeDifference(prevTime, newTime);
+    if (dt <= 0 || dt > params.imu_propagation_max_time)
+    {
+        state_.imu_velocity.reset();
+        return;
+    }
+
+    // The pose difference measures the average velocity over the interval:
+    const auto   z     = (newPose.translation() - prevPose.translation()) * (1.0 / dt);
+    const double var_z = mrpt::square(params.sigma_relative_pose_linear / dt);
+
+    // From the state at prevTime, the IMU predicts both that average and the
+    // velocity at newTime. Correcting the prediction by the measured error of
+    // the average leaves no lag under acceleration, unlike a constant-velocity
+    // filter. Only a velocity estimated at prevTime continues the filter;
+    // otherwise (e.g. another source updated the pose since) it restarts from
+    // the measurement, keeping the bias learned so far.
+    const bool  haveV0 = state_.imu_velocity && state_.imu_velocity_tim == prevTime;
+    const auto& b      = state_.imu_accel_bias;
+    const auto  v0     = haveV0 ? *state_.imu_velocity : z;
+    const auto  in     = imu_integrate(prevPose.getRotationMatrix(), v0, prevTime, newTime);
+    if (!in)
+    {
+        state_.imu_velocity.reset();
+        return;
+    }
+    const auto V            = in->velocity - b * dt;
+    const auto predictedAvg = (in->displacement - b * (0.5 * dt * dt)) * (1.0 / dt);
+
+    state_.imu_velocity_tim = newTime;
+
+    if (!haveV0)
+    {
+        // (Re)start: the measured average, moved to its end with the IMU.
+        constexpr double kInitialBiasSigma = 0.5;  // [m/s²]
+        if (state_.imu_P_bb <= 0)  // never initialized
+        {
+            state_.imu_accel_bias = {0, 0, 0};
+            state_.imu_P_bb       = mrpt::square(kInitialBiasSigma);
+        }
+        state_.imu_velocity = z + (V - predictedAvg);
+        state_.imu_P_vv     = var_z;
+        state_.imu_P_vb     = 0;
+        return;
+    }
+
+    // Kalman filter on (velocity, bias), per axis. Predict with
+    // v' = v + (a - b)·dt, b' = b:  F = [1 -dt; 0 1].
+    const double Pvv = state_.imu_P_vv - 2 * dt * state_.imu_P_vb + dt * dt * state_.imu_P_bb +
+                       mrpt::square(params.imu_propagation_sigma_acc * dt);
+    const double Pvb = state_.imu_P_vb - dt * state_.imu_P_bb;
+    const double Pbb = state_.imu_P_bb + mrpt::square(params.imu_propagation_sigma_bias) * dt;
+
+    // Update with the measured average velocity. Its prediction depends on the
+    // state at newTime as avg = v' + (bias-free terms) + b'·dt/2:  H = [1 dt/2].
+    const double h1   = 0.5 * dt;
+    const double PHt0 = Pvv + h1 * Pvb;
+    const double PHt1 = Pvb + h1 * Pbb;
+    const double S    = PHt0 + h1 * PHt1 + var_z;
+    const double K0   = PHt0 / S;
+    const double K1   = PHt1 / S;
+
+    const auto innovation = z - predictedAvg;
+    state_.imu_velocity   = V + innovation * K0;
+    state_.imu_accel_bias = b + innovation * K1;
+
+    state_.imu_P_vv = Pvv - K0 * PHt0;
+    state_.imu_P_vb = Pvb - K0 * PHt1;
+    state_.imu_P_bb = Pbb - K1 * PHt1;
+}
+
 void StateEstimationSimple::fuse_all_pending_imu()
 {
     if (state_.pending_imu.empty())
@@ -503,6 +797,64 @@ void StateEstimationSimple::fuse_all_pending_imu()
         return;
     }
     fuse_pending_imu_up_to(state_.pending_imu.rbegin()->first);
+}
+
+void StateEstimationSimple::bufferPendingOdometry(
+    const mrpt::obs::CObservation::ConstPtr& obs, const std::string& odomName)
+{
+    auto lck = std::scoped_lock(state_mtx_);
+
+    state_.pending_odometry.emplace(
+        std::make_pair(obs->timestamp, odomName), State::PendingOdometry{obs, odomName});
+
+    // Keep the buffer bounded in case nothing ever asks for an estimate:
+    const auto newest       = state_.pending_odometry.rbegin()->first.first;
+    const auto oldestToKeep = newest - std::chrono::duration_cast<mrpt::Clock::duration>(
+                                           std::chrono::duration<double>(kPendingOdometryMaxAge));
+    state_.pending_odometry.erase(
+        state_.pending_odometry.begin(),
+        state_.pending_odometry.lower_bound(std::make_pair(oldestToKeep, std::string())));
+}
+
+void StateEstimationSimple::fuse_pending_odometry_up_to(const mrpt::Clock::time_point& upTo)
+{
+    if (state_.pending_odometry.empty())
+    {
+        return;
+    }
+
+    // Every entry at or before `upTo`, whatever its source name:
+    auto itEnd = state_.pending_odometry.begin();
+    while (itEnd != state_.pending_odometry.end() && itEnd->first.first <= upTo)
+    {
+        ++itEnd;
+    }
+    for (auto it = state_.pending_odometry.begin(); it != itEnd; ++it)
+    {
+        const auto& e = it->second;
+        // Each of these fuses the IMU readings up to its own timestamp first,
+        // so both buffers are consumed interleaved in timestamp order:
+        if (auto o3d = std::dynamic_pointer_cast<const mrpt::obs::CObservationRobotPose>(e.obs);
+            o3d)
+        {
+            fuse_odometry_3d_pose_locked(*o3d, e.name);
+        }
+        else if (auto o2d = std::dynamic_pointer_cast<const mrpt::obs::CObservationOdometry>(e.obs);
+                 o2d)
+        {
+            fuse_odometry_locked(*o2d, e.name);
+        }
+    }
+    state_.pending_odometry.erase(state_.pending_odometry.begin(), itEnd);
+}
+
+void StateEstimationSimple::fuse_all_pending_odometry()
+{
+    if (state_.pending_odometry.empty())
+    {
+        return;
+    }
+    fuse_pending_odometry_up_to(state_.pending_odometry.rbegin()->first.first);
 }
 
 #if defined(MOLA_KERNEL_NAVSTATE_FILTER_HAS_GEO_REFERENCE)
@@ -522,6 +874,10 @@ std::optional<mola::Georeferencing> StateEstimationSimple::get_geo_reference() c
 void StateEstimationSimple::fuse_gnss(const mrpt::obs::CObservationGPS& gps)
 {
     auto lck = std::scoped_lock(state_mtx_);
+    // Same reason as in the pose paths: apply the odometry readings this
+    // instant covers before using last_pose, so a GNSS correction never
+    // lands on a pose whose odometry updates are still queued.
+    fuse_pending_odometry_up_to(gps.timestamp);
 
     // GNSS fusion is opt-in and needs a geo-reference to place fixes in the map
     // frame. Without either, ignore (legacy behavior; see the smoother for a
@@ -691,6 +1047,9 @@ void StateEstimationSimple::fuse_pose(
 
     // The IMU readings up to this measurement's own time belong before it in
     // the filter; newer ones stay buffered (see fuse_imu()):
+    // Apply the odometry readings this instant covers first, so the result
+    // depends on the measurement timestamps and not on delivery order:
+    fuse_pending_odometry_up_to(timestamp);
     fuse_pending_imu_up_to(timestamp);
 
     // Numerical sanity: variances >= 0 (== 0 allowed for some components only)
@@ -707,7 +1066,8 @@ void StateEstimationSimple::fuse_pose(
     // so that the derived twist reflects true ICP-to-ICP motion even when
     // fuse_odometry() / fuse_odometry_3d_pose() have modified last_pose in
     // between ICP scans.
-    auto& src = state_.per_source[frame_id];
+    auto& src        = state_.per_source[frame_id];
+    src.in_map_frame = true;
 
     double dt = 0;
     if (src.last_obs_tim)
@@ -751,12 +1111,21 @@ void StateEstimationSimple::fuse_pose(
 
         update_vel_filter(z, R_diag, timestamp, "fuse_pose");
     }
-    else
+    else if (src.last_pose.has_value())
     {
+        // dt <= 0 or dt >= max_time_to_use_velocity_model for a source that DID
+        // have a prior pose: a genuine reason to distrust whatever twist is
+        // currently held. When src.last_pose has no value at all (the very
+        // first fuse_pose() call ever for this source), there is simply
+        // nothing new to compute here, so any twist already held -- from
+        // params.initial_twist, or from a real fuse_twist()/fuse_odometry()/
+        // fuse_imu() measurement fused before this source's first pose -- is
+        // left untouched instead of being wiped out.
         MRPT_LOG_DEBUG_STREAM("fuse_pose(): resetting twist");
         state_.last_twist.reset();
         state_.last_twist_cov.reset();
-        state_.vel_filter_P = State().vel_filter_P;
+        state_.vel_filter_P      = State().vel_filter_P;
+        state_.vel_filter_seeded = State().vel_filter_seeded;
         for (auto& t : state_.vel_filter_last_tim)
         {
             t.reset();
@@ -772,6 +1141,37 @@ void StateEstimationSimple::fuse_pose(
         MRPT_LOG_DEBUG_STREAM(
             "fuse_pose(): twist_cov after=\n"
             << state_.last_twist_cov->asString());
+    }
+
+    // Drop a PRE-ANCHOR odometry baseline: fuse_odometry() can be called
+    // before the first fuse_pose() ever runs (odometry usually starts
+    // streaming immediately, LiDAR ICP needs a scan first), in which case
+    // it already skips applying an increment (no last_pose to add it to)
+    // but still records state_.last_odom_obs as a baseline. Once this,
+    // the FIRST pose, is accepted below, that baseline predates the anchor
+    // -- the next fuse_odometry() call would otherwise apply the delta
+    // spanning that whole pre-anchor gap onto the fresh pose. Only the
+    // first-ever pose needs this: once an odom baseline is established
+    // AFTER a pose already exists, subsequent fuse_pose() calls (periodic
+    // ICP corrections) must NOT reset it, or the odometry chain never gets
+    // to dead-reckon between them -- see test_odometry_fusion(), which
+    // fuse_pose()s twice before relying on the odometry increment still
+    // being anchored to the first call's baseline.
+    if (!state_.last_pose.has_value())
+    {
+        state_.last_odom_obs.reset();
+    }
+
+    if (params.imu_propagation)
+    {
+        if (src.last_pose && src.last_obs_tim)
+        {
+            update_imu_velocity(src.last_pose->mean, *src.last_obs_tim, pose.mean, timestamp);
+        }
+        else
+        {
+            state_.imu_velocity.reset();
+        }
     }
 
     src.last_pose    = pose;
@@ -798,6 +1198,9 @@ void StateEstimationSimple::fuse_twist(
 {
     auto lck = std::scoped_lock(state_mtx_);
 
+    // Apply the odometry readings this instant covers first, so the result
+    // depends on the measurement timestamps and not on delivery order:
+    fuse_pending_odometry_up_to(timestamp);
     fuse_pending_imu_up_to(timestamp);
 
     std::array<double, 6> z = {
@@ -815,6 +1218,55 @@ void StateEstimationSimple::fuse_twist(
     MRPT_LOG_DEBUG_STREAM("fuse_twist(): twist_cov= " << state_.last_twist_cov->asString());
 }
 
+#if defined(MOLA_KERNEL_NAVSTATE_FILTER_HAS_TRANSFORM_FRAME)
+bool StateEstimationSimple::transform_frame(const mrpt::poses::CPose3D& b)
+{
+    auto lck = std::scoped_lock(state_mtx_);
+
+    // Everything expressed in the map frame: the fused pose and the per-source
+    // last poses of map-frame sources, used to derive velocity from
+    // consecutive observations.
+    if (state_.imu_velocity)
+    {
+        state_.imu_velocity   = b.rotateVector(*state_.imu_velocity);
+        state_.imu_accel_bias = b.rotateVector(state_.imu_accel_bias);
+    }
+    if (state_.last_pose)
+    {
+        state_.last_pose->changeCoordinatesReference(b);
+    }
+    for (auto& [name, src] : state_.per_source)
+    {
+        if (!src.in_map_frame || !src.last_pose)
+        {
+            continue;
+        }
+        src.last_pose->changeCoordinatesReference(b);
+    }
+
+#if defined(MOLA_KERNEL_NAVSTATE_FILTER_HAS_GEO_REFERENCE)
+    // The ENU-to-map transform ends in the map frame, so it must follow it.
+    // The geodetic datum (geo_coord) is a property of the Earth, not of the
+    // map frame, hence left untouched.
+    if (geo_reference_)
+    {
+        geo_reference_->T_enu_to_map.changeCoordinatesReference(b);
+    }
+#endif
+
+    // Deliberately NOT touched: last_twist / last_twist_cov / vel_filter_P and
+    // the buffered IMU readings. All of them live in the vehicle's own frame
+    // (fuse_pose() derives velocity from `pose - previous_pose`, and
+    // estimated_navstate() extrapolates by right-composition), which a change
+    // of the map frame leaves invariant. Wheel-odometry readings are likewise
+    // in their own frame, and so are the odometry-frame entries skipped above.
+
+    MRPT_LOG_INFO_STREAM("transform_frame(): applied reference-frame change " << b);
+
+    return true;
+}
+#endif
+
 std::optional<NavState> StateEstimationSimple::estimated_navstate(
     const mrpt::Clock::time_point& timestamp, [[maybe_unused]] const std::string& frame_id)
 {
@@ -822,6 +1274,9 @@ std::optional<NavState> StateEstimationSimple::estimated_navstate(
 
     // Bring the filter up to the queried time, using only the IMU readings that
     // precede it (see fuse_imu()):
+    // Apply the odometry readings this instant covers first, so the result
+    // depends on the measurement timestamps and not on delivery order:
+    fuse_pending_odometry_up_to(timestamp);
     fuse_pending_imu_up_to(timestamp);
 
     if (!state_.last_pose_obs_tim)
@@ -831,8 +1286,17 @@ std::optional<NavState> StateEstimationSimple::estimated_navstate(
 
     const double dt = mrpt::system::timeDifference(*state_.last_pose_obs_tim, timestamp);
 
+    // Inertial propagation, if enabled and the IMU readings cover the interval.
+    // It may extrapolate further than the constant-twist model:
+    std::optional<Propagation> propagated;
+    if (params.imu_propagation && !state_.pose_already_updated_with_odom && dt >= 0 &&
+        dt <= params.imu_propagation_max_time)
+    {
+        propagated = imu_propagate(timestamp);
+    }
+
     if (!state_.last_twist || !state_.last_pose ||
-        std::abs(dt) > params.max_time_to_use_velocity_model)
+        (std::abs(dt) > params.max_time_to_use_velocity_model && !propagated))
     {
         return {};  // None
     }
@@ -841,7 +1305,11 @@ std::optional<NavState> StateEstimationSimple::estimated_navstate(
 
     mrpt::poses::CPose3D poseExtrapolation;
 
-    if (state_.pose_already_updated_with_odom)
+    if (propagated)
+    {
+        poseExtrapolation = propagated->increment;
+    }
+    else if (state_.pose_already_updated_with_odom)
     {
         // We have already updated the pose via wheels odometry, don't
         // extrapolate:
@@ -874,8 +1342,16 @@ std::optional<NavState> StateEstimationSimple::estimated_navstate(
     // pose cov:
     auto cov = state_.last_pose->cov;
 
-    const double varXYZ = mrpt::square(dt * params.sigma_random_walk_acceleration_linear);
-    const double varRot = mrpt::square(dt * params.sigma_random_walk_acceleration_angular);
+    double varXYZ = mrpt::square(dt * params.sigma_random_walk_acceleration_linear);
+    double varRot = mrpt::square(dt * params.sigma_random_walk_acceleration_angular);
+    if (propagated)
+    {
+        // Position: the initial velocity uncertainty, plus the accelerometer
+        // error integrated twice. Orientation: the gyroscope noise integrated.
+        varXYZ = state_.imu_P_vv * dt * dt + state_.imu_P_bb * mrpt::square(0.5 * dt * dt) +
+                 mrpt::square(0.5 * params.imu_propagation_sigma_acc * dt * dt);
+        varRot = mrpt::square(dt * params.sigma_imu_angular_velocity);
+    }
 
     for (int i = 0; i < 3; i++)
     {
@@ -899,6 +1375,12 @@ std::optional<NavState> StateEstimationSimple::estimated_navstate(
 
     // twist:
     ret.twist = state_.last_twist.value();
+    if (propagated)
+    {
+        ret.twist.vx = propagated->velocity_body.x;
+        ret.twist.vy = propagated->velocity_body.y;
+        ret.twist.vz = propagated->velocity_body.z;
+    }
 
     if (state_.last_twist_cov.has_value())
     {
@@ -965,7 +1447,8 @@ void StateEstimationSimple::onNewObservation(const CObservation::ConstPtr& o)
                 o->sensorLabel, state_.do_process_odometry_labels_re.get_regex(
                                     params.do_process_odometry_labels_re)))
         {
-            this->fuse_odometry(*obsOdom, o->sensorLabel);
+            // Buffered, not fused on arrival: see fuse_pending_odometry_up_to().
+            bufferPendingOdometry(o, o->sensorLabel);
         }
         else
         {
@@ -978,15 +1461,30 @@ void StateEstimationSimple::onNewObservation(const CObservation::ConstPtr& o)
     else if (auto obsPose = std::dynamic_pointer_cast<const mrpt::obs::CObservationRobotPose>(o);
              obsPose)
     {
-        if (std::regex_match(
-                o->sensorLabel, state_.do_process_odometry_labels_re.get_regex(
-                                    params.do_process_odometry_labels_re)))
+        if (o->sensorLabel == "ground_truth" && !params.fuse_ground_truth_label)
+        {
+            // MOLA's dataset sources publish their reference trajectory as a
+            // CObservationRobotPose labeled "ground_truth" (KITTI, KITTI-360,
+            // MulRan, Paris-Luco). The offline mola-lidar-odometry-cli never
+            // sees it -- datasetGetObservations() carries only real sensors --
+            // but the online mola-cli replay path does, and fusing it would
+            // silently invalidate any accuracy number measured against that
+            // same trajectory.
+            MRPT_LOG_ONCE_WARN(
+                "Ignoring observations labeled 'ground_truth': fusing a dataset's own reference "
+                "trajectory would invalidate any accuracy evaluation against it. Set "
+                "'fuse_ground_truth_label: true' if that is really what you want.");
+        }
+        else if (std::regex_match(
+                     o->sensorLabel, state_.do_process_odometry_labels_re.get_regex(
+                                         params.do_process_odometry_labels_re)))
         {
             // Route to the dedicated 3D-odometry path so it never touches
             // last_pose_obs_tim (which belongs to the LiDAR ICP source) and
             // applies the pose as an incremental delta in the SLAM frame rather
             // than replacing last_pose with the absolute odom-frame pose.
-            this->fuse_odometry_3d_pose(*obsPose, o->sensorLabel);
+            // Buffered, not fused on arrival: see fuse_pending_odometry_up_to().
+            bufferPendingOdometry(o, o->sensorLabel);
         }
         else
         {
@@ -1025,6 +1523,7 @@ std::optional<mrpt::math::TTwist3D> StateEstimationSimple::get_last_twist()
     auto lck = std::scoped_lock(state_mtx_);
 
     // No time of interest is given here, so everything received is fused:
+    fuse_all_pending_odometry();
     fuse_all_pending_imu();
 
     return state_.last_twist;

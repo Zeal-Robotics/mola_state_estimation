@@ -77,8 +77,8 @@ void FastPredictor::clear()
 }
 
 std::optional<NavState> FastPredictor::predict(
-    const mrpt::Clock::time_point& t_query, const std::string& frame_id,
-    const Parameters& params) const
+    const mrpt::Clock::time_point& t_query, const std::string& frame_id, const Parameters& params,
+    mrpt::Clock::time_point* anchorStampOut) const
 {
     std::shared_ptr<const Snapshot> snap;
     {
@@ -88,6 +88,10 @@ std::optional<NavState> FastPredictor::predict(
     if (!snap || !snap->valid)
     {
         return std::nullopt;
+    }
+    if (anchorStampOut)
+    {
+        *anchorStampOut = snap->anchorStamp;
     }
 
     // dt from the anchor (newest solved keyframe) to the requested time.
@@ -130,8 +134,9 @@ std::optional<NavState> FastPredictor::predict(
         {
             mrpt::poses::CPose3DPDFGaussian anchorPose;
             anchorPose.copyFrom(ret.pose);
-            ret.pose.copyFrom(
-                extrapolate_pose_pdf(params, anchorPose, ret.twist, anchorTwistCov, dt));
+            auto mapPdf = extrapolate_pose_pdf(params, anchorPose, ret.twist, anchorTwistCov, dt);
+            apply_pose_sigma_floor(params, mapPdf);
+            ret.pose.copyFrom(mapPdf);
             return ret;
         }
 
@@ -161,7 +166,12 @@ std::optional<NavState> FastPredictor::predict(
             const auto mapPred =
                 extrapolate_pose_pdf(params, anchorPose, ret.twist, anchorTwistCov, dt);
             // Transform the {map}-frame prediction into {odom_i}: pred (-) T_frame_wrt_map.
-            ret.pose.copyFrom(mapPred - itFrame->second);
+            // The floor goes on AFTER the conversion, for the same reason as in
+            // the synchronous path: it is a statement about the frame the caller
+            // asked for.
+            auto framePdf = mapPred - itFrame->second;
+            apply_pose_sigma_floor(params, framePdf);
+            ret.pose.copyFrom(framePdf);
             return ret;
         }
 
@@ -172,8 +182,10 @@ std::optional<NavState> FastPredictor::predict(
             return std::nullopt;
         }
 
-        ret.pose.copyFrom(
-            extrapolate_pose_pdf(params, rawAnchor.pose, ret.twist, anchorTwistCov, dtPred));
+        auto rawPdf =
+            extrapolate_pose_pdf(params, rawAnchor.pose, ret.twist, anchorTwistCov, dtPred);
+        apply_pose_sigma_floor(params, rawPdf);
+        ret.pose.copyFrom(rawPdf);
 
         return ret;
     }

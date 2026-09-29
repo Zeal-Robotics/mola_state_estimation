@@ -121,6 +121,15 @@ class Parameters
     /// Time to keep past observations in the filter
     double sliding_window_length = 5.0;  // [s]
 
+    /** Keep the pose of every keyframe as it leaves the sliding window, i.e.
+     *  its final optimized value, and serve them through
+     *  estimated_trajectory(). Off by default: in a live system nothing reads
+     *  them and the container would grow without bound. Intended for offline
+     *  runs that want the smoothed trajectory instead of the front end's own
+     *  registered poses.
+     */
+    bool keep_finalized_trajectory = false;
+
     double min_time_difference_to_create_new_frame = 0.01;  // [s]
 
     /// If the time between two keyframes is larger than this, a warning will be
@@ -157,11 +166,151 @@ class Parameters
      */
     double odometry_min_sample_period = 0.0;  // [s]
 
-    /** High-rate same-sensor decimation for IMU. If > 0, IMU readings arriving
-     * less than this many seconds after the last *processed* one are skipped.
-     * Unlike wheel odometry, IMU attitude/gravity are absolute observations, so
-     * dropping intermediate readings simply lowers the redundant-factor rate;
-     * there is nothing to accumulate. 0 disables it. [seconds]
+    /** \name Wheel-odometry motion-model noise (fuse_odometry(), MRPT's
+     *  mmGaussian proportional model over each odometry increment: noise
+     *  grows with the distance traveled / angle turned, rather than being a
+     *  fixed per-step sigma). Defaults match MRPT's CActionRobotMovement2D
+     *  Gaussian model defaults. Lower a1..a4 for platforms with accurate
+     *  encoders and no wheel slip; raise for loose terrain.
+     *
+     *  Units, verified against MRPT's computeFromOdometry_modelGaussian()
+     *  implementation directly (its own header/docs comment says a2 [m/deg]
+     *  and a3 [deg/m], which is WRONG -- the implementation multiplies a2
+     *  and a3 by CPose2D::phi(), which is radians, not by a degrees
+     *  conversion of it):
+     *    sigma_xy  = minStdXY  + a1*|translation| + a2*|rotation_rad|
+     *    sigma_phi = minStdPHI + a3*|translation| + a4*|rotation_rad|
+     *  So a1 [m/m], a2 [m/rad], a3 [rad/m], a4 [rad/rad] (dimensionless
+     *  either way). Don't trust a docs-only cross-check for this MRPT
+     *  struct; the implementation is the source of truth.
+     *
+     *  min_std_xy/min_std_phi_deg are NOT the effective floor in practice:
+     *  fuse_odometry_locked() adds a further +1e-4 to every diagonal
+     *  covariance entry after this model runs (an independent numerical
+     *  regularizer, unrelated to these two fields), i.e. sigma >= 0.01 m /
+     *  0.01 rad (~0.57 deg) regardless of what these are set to. Tuning
+     *  either below that is a no-op today.
+     *  @{ */
+    double odom_motion_model_a1 = 0.01;  // [m/m] noise growth per m traveled
+    double odom_motion_model_a2 = 0.05729577951;  // [m/rad] MRPT default: RAD2DEG(0.001)
+    double odom_motion_model_a3 =
+        0.017453292519943295;  // [rad/m] MRPT default: DEG2RAD(1.0), noise growth per m traveled
+    double odom_motion_model_a4              = 0.05;  // [rad/rad] noise growth per rad rotated
+    double odom_motion_model_min_std_xy      = 1e-3;  // [m] -- see effective-floor note above
+    double odom_motion_model_min_std_phi_deg = 0.1;  // [deg] -- see effective-floor note above
+    /** @} */
+
+    /** Regex of odometry frame_ids (see fuse_pose()) whose poses are fused as
+     *  RELATIVE increments between consecutive keyframes, plus one absolute
+     *  factor added once to resolve T_map_to_odom_i, instead of as an absolute
+     *  pose per reading. This is how wheel odometry is always fused,
+     *  generalized to any fuse_pose() source.
+     *
+     *  It is what a DRIFTING source needs. An absolute-pose factor asserts that
+     *  the source's whole trajectory relates to {map} by one rigid transform,
+     *  which only holds while the drift accumulated across the sliding window
+     *  stays below the covariance given; a relative factor asserts only the
+     *  increment, which is drift-free by construction. Visual odometry is the
+     *  motivating case: its per-increment accuracy can be excellent while its
+     *  absolute pose in its own frame walks away steadily.
+     *
+     *  In relative mode the covariance passed to fuse_pose() is read as the
+     *  uncertainty of ONE INCREMENT, not of the absolute pose.
+     *
+     *  It is a trade, not a free win, and which way it goes depends on how much
+     *  the source drifts across the sliding window. Measured on the synthetic
+     *  case in test-relative-pose-factors: with a source whose frame slides
+     *  0.05 m/s (0.25 m across a 5 s window, fifty times its declared
+     *  per-increment sigma) the absolute formulation degrades by 2.3x while the
+     *  relative one does not move at all -- but with no drift at all the
+     *  absolute formulation is the better of the two, because N absolute poses
+     *  carry more information than N increments. Use this for a source that
+     *  really does drift; leave it off otherwise.
+     *
+     *  Empty (the default) keeps every source on the absolute formulation.
+     */
+    std::string relative_factors_frame_ids_re;
+
+    /** High-rate same-sensor decimation for fuse_pose() sources. If > 0,
+     * readings of a given frame_id arriving less than this many seconds after
+     * the last *kept* one of that same frame_id are dropped before they reach
+     * the graph. A pose source publishing in the hundreds of Hz otherwise
+     * packs the sliding window with keyframes that carry no new information,
+     * and the solver pays for every one of them.
+     *
+     * Nothing is lost under the relative formulation: a dropped reading does
+     * not advance the source's chain, so the next kept one asserts the whole
+     * merged span as a single increment. Under the absolute formulation there
+     * is nothing to accumulate either, since each reading stands alone.
+     *
+     * It applies to EVERY fuse_pose() source, e.g. LiDAR odometry too. Keep
+     * it well below the period of any source that must not be thinned: at
+     * about that period, timestamp jitter alone drops every other reading.
+     * A dropped reading still refreshes the source's own-frame pose that
+     * estimated_navstate() extrapolates from.
+     *
+     * 0 disables it. Independent of, and coarser than,
+     * min_time_difference_to_create_new_frame. [seconds]
+     */
+    double pose_min_sample_period = 0.0;  // [s]
+
+    /** \name Known per-increment accuracy of a relative fuse_pose() source
+     *  @{ */
+
+    /** If > 0, this REPLACES the linear part of the covariance a relative
+     * fuse_pose() source supplies, for the increment factors only. A drifting
+     * source usually publishes the covariance of its absolute dead-reckoned
+     * pose, which grows without bound and says nothing about the quality of
+     * one increment; when the per-increment accuracy is known independently
+     * (from the platform's kinematics, say), asserting it here is both simpler
+     * and far more informative than trusting the accumulated number.
+     *
+     * The value describes ONE increment, whatever it spans; motion-dependent
+     * error belongs in relative_pose_increment_sigma_per_sqrt_meter, which
+     * scales with the increment and so with pose_min_sample_period. 0 keeps the
+     * source's own covariance. Its correlations with the angular part are
+     * discarded too. [m]
+     */
+    double relative_pose_increment_sigma_lin = 0.0;  // [m]
+
+    /** Angular counterpart of relative_pose_increment_sigma_lin. [rad] */
+    double relative_pose_increment_sigma_ang = 0.0;  // [rad]
+
+    /** Growth of the per-increment linear uncertainty with the distance the
+     * increment spans, as a random walk: the asserted variance is
+     * `relative_pose_increment_sigma_lin^2 + k^2 * distance`. A dead-reckoned
+     * error is not a fixed number per reading: slips and skids happen while
+     * moving, independently along the path. Because variance, not sigma, grows
+     * linearly with distance, the total asserted over a path does not depend on
+     * how many increments it is split into (keyframe rate,
+     * pose_min_sample_period). Requires relative_pose_increment_sigma_lin > 0,
+     * which becomes the floor asserted while standing still. 0 disables it.
+     * [m/sqrt(m)] */
+    double relative_pose_increment_sigma_per_sqrt_meter = 0.0;
+
+    /** Angular counterpart of relative_pose_increment_sigma_per_sqrt_meter,
+     * growing with the rotated angle. Requires relative_pose_increment_sigma_ang
+     * > 0. [rad/sqrt(rad)] */
+    double relative_pose_increment_sigma_per_sqrt_rad = 0.0;
+
+    /** If > 0, fuse_pose() factors, both absolute and relative, are wrapped in
+     * a Huber m-estimator with this threshold, in whitened units, i.e. in
+     * sigmas of the covariance supplied for that factor. So it only means
+     * something when that covariance is calibrated. A dead-reckoning source
+     * produces occasional gross errors (a slipped foot, a skidded wheel), and
+     * under a plain Gaussian each one pulls with unbounded weight. Huber is
+     * convex: unlike a redescending kernel it cannot switch off a correct
+     * reading whose keyframe starts far from it. The one-time anchor factor
+     * of a relative source is not wrapped. 0 disables it. */
+    double pose_robust_huber_threshold = 0.0;
+
+    /** @} */
+
+    /** High-rate same-sensor decimation for IMU. If > 0, IMU readings are
+     * averaged over periods of this many seconds, and one averaged reading per
+     * period is fused (see mola::imu::ImuAverager). Averaging, rather than keeping one raw
+     * reading, keeps vibration faster than this rate from aliasing into the
+     * gravity and angular-velocity factors. 0 fuses every reading. [seconds]
      */
     double imu_min_sample_period = 0.0;  // [s]
 
@@ -190,6 +339,42 @@ class Parameters
     double predict_twist_filter_time_const = 0.3;
     double sigma_integrator_position       = 0.10;  // [m]
     double sigma_integrator_orientation    = 0.10;  // [rad]
+
+    /** @name Floor on the uncertainty reported by estimated_navstate()
+     *  @{ */
+
+    /** [m] Flat, dt-independent floor added to the position variance of the
+     * pose returned by estimated_navstate() (and by the asynchronous fast
+     * predictor). 0 disables it, which is the shipped default and reproduces
+     * the behavior of every release before this parameter existed.
+     *
+     * This is NOT a model of anything the graph knows. It exists because a
+     * front end may use the returned covariance as a WEIGHT, not merely as a
+     * diagnostic: mola_lidar_odometry turns a non-zero `pose.cov_inv` into a
+     * prior factor inside its ICP solve. The marginal this estimator reports is
+     * the graph's own opinion of its extrapolation, and when the graph is
+     * confident that opinion is tight enough to pin the registration to the
+     * prediction instead of letting the scan data move it. A floor bounds how
+     * hard the estimator is allowed to lean on the front end, independently of
+     * how well conditioned the window happens to be.
+     *
+     * The lightweight estimator has carried the same knob since it was written
+     * (`mola_state_estimation_simple`, same parameter names, 0.5 m / 0.1 rad),
+     * which is why the two estimators hand a front end priors of very different
+     * strength. Set this to that value to make the two comparable.
+     *
+     * Applied isotropically, so it is invariant to whether the caller reads the
+     * rotation block in Euler (yaw, pitch, roll) or Lie-tangent (w_x, w_y, w_z)
+     * order: adding the same variance to all three diagonal entries commutes
+     * with any permutation of them.
+     */
+    double sigma_relative_pose_linear = 0.0;  // [m]
+
+    /** [rad] Angular counterpart of sigma_relative_pose_linear. 0 disables it.
+     */
+    double sigma_relative_pose_angular = 0.0;  // [rad]
+
+    /** @} */
 
     double sigma_twist_from_consecutive_poses_linear  = 1.0;  // [m/s]
     double sigma_twist_from_consecutive_poses_angular = 1.0;  // [rad/s]
@@ -339,6 +524,12 @@ class Parameters
 
     /// regex for GNSS (GPS) labels (ROS topics) to be accepted as inputs
     std::string do_process_gnss_labels_re = ".*";
+
+    /** Allow fusing CObservationRobotPose observations labeled "ground_truth",
+     *  which is how MOLA's offline dataset sources publish their reference
+     *  trajectory. Off by default: fusing it makes any accuracy number measured
+     *  against that same trajectory meaningless. */
+    bool fuse_ground_truth_label = false;
 
     /** @} */
 

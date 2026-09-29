@@ -157,6 +157,87 @@ void test_odometry_fusion()
 }
 
 // --------------------------------------------------------------------------
+// Test 2b: Pre-anchor odometry is discarded, not carried across fuse_pose()
+// --------------------------------------------------------------------------
+// Odometry can start streaming before the first LiDAR pose is ever fused
+// (fuse_odometry() is called with no last_pose yet, so it records a baseline
+// but applies no increment). That baseline must not survive past the first
+// fuse_pose(): otherwise the next post-anchor odometry reading computes its
+// delta against a pre-anchor value, injecting motion that predates the
+// anchor into the fresh pose.
+void test_pre_anchor_odometry_discarded()
+{
+    std::cout << "[Test 2b] Pre-anchor odometry discarded at first fuse_pose()... ";
+
+    mola::state_estimation_simple::StateEstimationSimple estimator;
+    estimator.setMinLoggingLevel(mrpt::system::LVL_DEBUG);
+    estimator.initialize(get_default_config());
+
+    // 1. Odometry arrives BEFORE any pose: records a baseline, no last_pose
+    //    to apply an increment to yet.
+    {
+        mrpt::obs::CObservationOdometry odom;
+        odom.timestamp = mrpt::Clock::fromDouble(0.0);
+        odom.odometry  = mrpt::poses::CPose2D::Identity();
+        estimator.fuse_odometry(odom);
+    }
+    // 2. More pre-anchor motion: if this baseline survived to after the
+    //    anchor, the next post-anchor reading would jump by ~5m.
+    {
+        mrpt::obs::CObservationOdometry odom;
+        odom.timestamp = mrpt::Clock::fromDouble(0.5);
+        odom.odometry  = mrpt::poses::CPose2D(5.0, 0, 0);
+        estimator.fuse_odometry(odom);
+    }
+
+    // 3. First LiDAR pose ever: the anchor. A second call at the same
+    //    position follows immediately, purely so estimated_navstate() below
+    //    has a twist to work with (it needs two consecutive per-source poses
+    //    to compute one, per fuse_pose()'s own logic) -- unrelated to what
+    //    this test is actually checking.
+    estimator.fuse_pose(
+        mrpt::Clock::fromDouble(1.0),
+        mrpt::poses::CPose3DPDFGaussian(
+            mrpt::poses::CPose3D::Identity(), mrpt::math::CMatrixDouble66::Identity()),
+        "map");
+    estimator.fuse_pose(
+        mrpt::Clock::fromDouble(1.05),
+        mrpt::poses::CPose3DPDFGaussian(
+            mrpt::poses::CPose3D::Identity(), mrpt::math::CMatrixDouble66::Identity()),
+        "map");
+
+    // 4. First post-anchor odometry reading: must only re-establish the
+    //    baseline (no increment applied yet), NOT jump by "0.1 - 5.0".
+    {
+        mrpt::obs::CObservationOdometry odom;
+        odom.timestamp = mrpt::Clock::fromDouble(1.1);
+        odom.odometry  = mrpt::poses::CPose2D(0.1, 0, 0);
+        estimator.fuse_odometry(odom);
+    }
+    {
+        auto stateOpt = estimator.estimated_navstate(mrpt::Clock::fromDouble(1.1), "map");
+        ASSERT_(stateOpt.has_value());
+        ASSERT_NEAR_(stateOpt->pose.mean.x(), 0.0, 1e-3);
+    }
+
+    // 5. Second post-anchor reading: NOW a real 0.1m increment applies,
+    //    relative to step 4's baseline.
+    {
+        mrpt::obs::CObservationOdometry odom;
+        odom.timestamp = mrpt::Clock::fromDouble(1.2);
+        odom.odometry  = mrpt::poses::CPose2D(0.2, 0, 0);
+        estimator.fuse_odometry(odom);
+    }
+    {
+        auto stateOpt = estimator.estimated_navstate(mrpt::Clock::fromDouble(1.2), "map");
+        ASSERT_(stateOpt.has_value());
+        ASSERT_NEAR_(stateOpt->pose.mean.x(), 0.1, 1e-3);
+    }
+
+    std::cout << "OK\n";
+}
+
+// --------------------------------------------------------------------------
 // Test 3: IMU Fusion (Angular Velocity)
 // --------------------------------------------------------------------------
 // The simple estimator uses IMU to overwrite the angular velocity (twist)
@@ -1166,7 +1247,602 @@ void test_imu_survives_reset()
     std::cout << "OK\n";
 }
 
+// --------------------------------------------------------------------------
+// Test: initial_twist seed (MOLA_INITIAL_VX)
+// --------------------------------------------------------------------------
+// A dataset that starts already in motion (e.g. a highway-speed KITTI
+// sequence) configures params.initial_twist so the very first ICP prior
+// already assumes forward motion, instead of waiting for two ICP poses to
+// derive a velocity. Regression covered here: initial_twist used to be parsed
+// but never applied to state_.last_twist, and even when seeded, the very
+// first fuse_pose() call unconditionally reset the twist to "unknown" (it has
+// no per-source pose history yet), wiping the seed out before it could ever
+// be used to extrapolate.
+void test_initial_twist_seed()
+{
+    std::cout << "[Test] initial_twist seed (MOLA_INITIAL_VX)... ";
+
+    const char* yaml_text = R"###(
+params:
+    max_time_to_use_velocity_model: 2.0
+    sigma_random_walk_acceleration_linear: 1.0
+    sigma_random_walk_acceleration_angular: 1.0
+    sigma_relative_pose_linear: 0.1
+    sigma_relative_pose_angular: 0.1
+    sigma_imu_angular_velocity: 0.05
+    enforce_planar_motion: false
+    initial_twist: [5.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+)###";
+
+    mola::state_estimation_simple::StateEstimationSimple est;
+    est.initialize(mrpt::containers::yaml::FromText(yaml_text));
+
+    // (a) Right after initialize(), the seed must be visible with no
+    // observations fused at all.
+    {
+        auto tw = est.get_last_twist();
+        ASSERT_(tw.has_value());
+        ASSERT_NEAR_(tw->vx, 5.0, 1e-9);
+    }
+
+    // (b) The FIRST fuse_pose() call ever must not wipe out the seed: this
+    // source has no prior pose of its own yet, which is exactly the branch
+    // that used to unconditionally reset the twist.
+    est.fuse_pose(
+        mrpt::Clock::fromDouble(0.0),
+        mrpt::poses::CPose3DPDFGaussian(
+            mrpt::poses::CPose3D::Identity(), mrpt::math::CMatrixDouble66::Identity()),
+        "map");
+    {
+        auto tw = est.get_last_twist();
+        ASSERT_(tw.has_value());
+        ASSERT_NEAR_(tw->vx, 5.0, 1e-9);
+    }
+
+    // (c) estimated_navstate() extrapolates using the seeded twist from the
+    // single known pose: x = 0 + 5.0 * 0.5 = 2.5.
+    {
+        auto s = est.estimated_navstate(mrpt::Clock::fromDouble(0.5), "map");
+        ASSERT_(s.has_value());
+        ASSERT_NEAR_(s->pose.mean.x(), 2.5, 1e-3);
+    }
+
+    // (d) Once a real velocity measurement arrives (second ICP pose, true
+    // speed 2.0 m/s), it is blended with the seed via their respective
+    // covariances rather than overwritten outright. With the default seed
+    // sigma (20 m/s, i.e. var=400) versus the measurement's var=0.01, the
+    // seed carries almost no weight, so the blended result lands extremely
+    // close to the raw measurement: K = 400/(400+0.01), vx = 5.0 + K*(2.0-5.0).
+    est.fuse_pose(
+        mrpt::Clock::fromDouble(1.0),
+        mrpt::poses::CPose3DPDFGaussian(
+            mrpt::poses::CPose3D(2.0, 0, 0), mrpt::math::CMatrixDouble66::Identity()),
+        "map");
+    {
+        const double K        = 400.0 / (400.0 + 0.01);
+        const double expected = 5.0 + K * (2.0 - 5.0);
+        auto         tw       = est.get_last_twist();
+        ASSERT_(tw.has_value());
+        ASSERT_NEAR_(tw->vx, expected, 1e-6);
+    }
+
+    // (e) reset() must re-seed the initial twist (params are not cleared).
+    est.reset();
+    {
+        auto tw = est.get_last_twist();
+        ASSERT_(tw.has_value());
+        ASSERT_NEAR_(tw->vx, 5.0, 1e-9);
+    }
+
+    std::cout << "OK\n";
+}
+
+// --------------------------------------------------------------------------
+// Test: an unseeded component's first observation bootstraps, even after a
+// sibling component has already been observed
+// --------------------------------------------------------------------------
+// Regression: update_vel_filter() used to decide "true bootstrap vs. blend
+// with seed" from state_.last_twist.has_value(), which becomes true as soon
+// as ANY component is observed. A component that was never configured via
+// params.initial_twist and never observed would then wrongly take the
+// "blend" path using the uninformative default P (1e4) as if it had been
+// seeded, instead of bootstrapping outright from its own measurement.
+void test_partial_observation_bootstraps_independently()
+{
+    std::cout << "[Test] Partial observation bootstraps each component independently... ";
+
+    mola::state_estimation_simple::StateEstimationSimple est;
+    est.initialize(get_default_config());  // no initial_twist configured
+
+    // Only vx observed: bootstraps vx, and makes state_.last_twist non-empty.
+    {
+        mrpt::math::CMatrixDouble66 cov;
+        cov.setZero();
+        for (int i = 0; i < 6; i++)
+        {
+            cov(i, i) = 1e8;
+        }
+        cov(0, 0) = 0.01;
+        est.fuse_twist(mrpt::Clock::fromDouble(0.0), mrpt::math::TTwist3D(5.0, 0, 0, 0, 0, 0), cov);
+    }
+
+    // Only wz observed for the first time, with a comparatively large (i.e.
+    // imprecise) measurement noise. A correct bootstrap takes the measurement
+    // outright (K=1); the buggy blend-with-default-P path would instead
+    // average it down towards the previous (zero) value.
+    {
+        mrpt::math::CMatrixDouble66 cov;
+        cov.setZero();
+        for (int i = 0; i < 6; i++)
+        {
+            cov(i, i) = 1e8;
+        }
+        cov(5, 5) = 5000.0;
+        est.fuse_twist(mrpt::Clock::fromDouble(1.0), mrpt::math::TTwist3D(0, 0, 0, 0, 0, 3.0), cov);
+    }
+
+    auto tw = est.get_last_twist();
+    ASSERT_(tw.has_value());
+    ASSERT_NEAR_(tw->vx, 5.0, 1e-6);
+    ASSERT_NEAR_(tw->wz, 3.0, 1e-6);
+
+    std::cout << "OK\n";
+}
+
+// --------------------------------------------------------------------------
+// Test: real measurements fused before the very first fuse_pose() must survive
+// --------------------------------------------------------------------------
+// fuse_pose()'s "this source has no pose history yet" branch fires on the
+// very first fuse_pose() call ever, regardless of whether a real velocity was
+// already established by another path. It must only discard the twist when
+// this source DID have a prior pose but the new one is unusable (backwards or
+// stale dt) -- never merely because this is the first pose ever seen.
+void test_real_measurement_survives_first_fuse_pose()
+{
+    std::cout << "[Test] Real measurement survives the first fuse_pose()... ";
+
+    // (a) fuse_twist() before any fuse_pose() at all.
+    {
+        mola::state_estimation_simple::StateEstimationSimple est;
+        est.initialize(get_default_config());
+
+        auto twistCov = mrpt::math::CMatrixDouble66::Identity();
+        twistCov *= 0.01;
+        est.fuse_twist(
+            mrpt::Clock::fromDouble(0.0), mrpt::math::TTwist3D(3.0, 0, 0, 0, 0, 0), twistCov);
+
+        auto tw = est.get_last_twist();
+        ASSERT_(tw.has_value());
+        ASSERT_NEAR_(tw->vx, 3.0, 1e-6);
+
+        // First-ever fuse_pose(): must not wipe out the fuse_twist() result.
+        est.fuse_pose(
+            mrpt::Clock::fromDouble(0.0),
+            mrpt::poses::CPose3DPDFGaussian(
+                mrpt::poses::CPose3D::Identity(), mrpt::math::CMatrixDouble66::Identity()),
+            "map");
+
+        tw = est.get_last_twist();
+        ASSERT_(tw.has_value());
+        ASSERT_NEAR_(tw->vx, 3.0, 1e-6);
+
+        auto s = est.estimated_navstate(mrpt::Clock::fromDouble(0.5), "map");
+        ASSERT_(s.has_value());
+        ASSERT_NEAR_(s->pose.mean.x(), 1.5, 1e-3);
+    }
+
+    // (b) fuse_imu() buffered before any fuse_pose(): the buffered reading is
+    // fused by fuse_pending_imu_up_to() at the TOP of this same, first-ever
+    // fuse_pose() call, so the reset branch below it must not immediately
+    // erase what was just fused.
+    {
+        mola::state_estimation_simple::StateEstimationSimple est;
+        est.initialize(get_default_config());
+
+        mrpt::obs::CObservationIMU imu;
+        imu.timestamp = mrpt::Clock::fromDouble(0.0);
+        imu.set(mrpt::obs::IMU_WX, 0.0);
+        imu.set(mrpt::obs::IMU_WY, 0.0);
+        imu.set(mrpt::obs::IMU_WZ, 2.0);
+        imu.sensorPose = mrpt::poses::CPose3D::Identity();
+        est.fuse_imu(imu);
+
+        // Note: fuse_imu() only buffers, it does not fuse the reading itself
+        // (that happens below, inside fuse_pose()); get_last_twist() is not
+        // queried here because it would fuse the buffered reading on its own,
+        // which is not the scenario under test.
+
+        est.fuse_pose(
+            mrpt::Clock::fromDouble(0.0),
+            mrpt::poses::CPose3DPDFGaussian(
+                mrpt::poses::CPose3D::Identity(), mrpt::math::CMatrixDouble66::Identity()),
+            "map");
+
+        auto tw = est.get_last_twist();
+        ASSERT_(tw.has_value());
+        ASSERT_NEAR_(tw->wz, 2.0, 1e-6);
+
+        auto s = est.estimated_navstate(mrpt::Clock::fromDouble(1.0), "map");
+        ASSERT_(s.has_value());
+        double y, p, r;
+        s->pose.mean.getYawPitchRoll(y, p, r);
+        ASSERT_NEAR_(y, 2.0, 1e-3);
+    }
+
+    std::cout << "OK\n";
+}
+
+// --------------------------------------------------------------------------
+// Test: invalid initial_twist_sigma_lin/ang are rejected
+// --------------------------------------------------------------------------
+// A zero, negative, or non-finite sigma would build a singular last_twist_cov
+// in seedInitialTwistFromParams(), which would later throw out of
+// inverse_LLt() in estimated_navstate(). Parameters::loadFrom() must reject
+// it up front instead, at config-load time.
+void test_initial_twist_invalid_sigma_rejected()
+{
+    std::cout << "[Test] Invalid initial_twist sigma rejected... ";
+
+    const auto expect_throw = [](const std::string& sigma_lin_yaml)
+    {
+        const std::string yaml_text =
+            "params:\n"
+            "    max_time_to_use_velocity_model: 2.0\n"
+            "    sigma_relative_pose_linear: 0.1\n"
+            "    sigma_relative_pose_angular: 0.1\n"
+            "    initial_twist: [5.0, 0.0, 0.0, 0.0, 0.0, 0.0]\n"
+            "    initial_twist_sigma_lin: " +
+            sigma_lin_yaml + "\n";
+
+        mola::state_estimation_simple::StateEstimationSimple est;
+        bool                                                 threw = false;
+        try
+        {
+            est.initialize(mrpt::containers::yaml::FromText(yaml_text));
+        }
+        catch (const std::exception&)
+        {
+            threw = true;
+        }
+        ASSERT_(threw);
+    };
+
+    expect_throw("0.0");  // zero -> singular covariance
+    expect_throw("-1.0");  // negative
+
+    // A config with a sane sigma must NOT throw (sanity check on the helper).
+    {
+        mola::state_estimation_simple::StateEstimationSimple est;
+        est.initialize(
+            mrpt::containers::yaml::FromText("params:\n"
+                                             "    max_time_to_use_velocity_model: 2.0\n"
+                                             "    sigma_relative_pose_linear: 0.1\n"
+                                             "    sigma_relative_pose_angular: 0.1\n"
+                                             "    initial_twist: [5.0, 0.0, 0.0, 0.0, 0.0, 0.0]\n"
+                                             "    initial_twist_sigma_lin: 20.0\n"));
+        ASSERT_(est.get_last_twist().has_value());
+    }
+
+    std::cout << "OK\n";
+}
+
+#if defined(MOLA_KERNEL_NAVSTATE_FILTER_HAS_TRANSFORM_FRAME)
+// A change of the map frame must not disturb an odometry source, whose
+// observations keep arriving in their own, untouched, reference frame.
+void test_transform_frame_leaves_odometry_frame_alone()
+{
+    std::cout << "[Test] transform_frame() keeps odometry-frame sources... ";
+
+    mola::state_estimation_simple::StateEstimationSimple est;
+    est.initialize(get_default_config());
+
+    const auto cov = mrpt::math::CMatrixDouble66::Identity();
+
+    auto send_wheel_odom = [&](double t, double x)
+    {
+        auto obs         = mrpt::obs::CObservationRobotPose::Create();
+        obs->timestamp   = mrpt::Clock::fromDouble(t);
+        obs->sensorLabel = "wheel_odom";
+        obs->pose        = mrpt::poses::CPose3DPDFGaussian(mrpt::poses::CPose3D(x, 0, 0), cov);
+        est.onNewObservation(obs);
+    };
+
+    // Two static observations, so that a (zero) twist exists and the state is
+    // queryable.
+    for (const double t : {0.0, 0.5})
+    {
+        est.fuse_pose(
+            mrpt::Clock::fromDouble(t),
+            mrpt::poses::CPose3DPDFGaussian(mrpt::poses::CPose3D::Identity(), cov), "map");
+        send_wheel_odom(t, 0.0);
+    }
+
+    // Change the map frame, then let odometry advance 1 m in its own frame.
+    // The fused pose must move by exactly that 1 m as seen in the new map
+    // frame, i.e. no extra offset leaks in from `b`.
+    const auto b = mrpt::poses::CPose3D(1, 2, 3, 25.0_deg, 0.0_deg, 10.0_deg);
+    ASSERT_(est.transform_frame(b));
+
+    auto before = est.estimated_navstate(mrpt::Clock::fromDouble(0.5), "map");
+    ASSERT_(before.has_value());
+
+    send_wheel_odom(1.0, 1.0);
+
+    auto after = est.estimated_navstate(mrpt::Clock::fromDouble(1.0), "map");
+    ASSERT_(after.has_value());
+
+    const auto delta = after->pose.mean - before->pose.mean;
+    ASSERT_NEAR_(delta.x(), 1.0, 1e-6);
+    ASSERT_NEAR_(delta.y(), 0.0, 1e-6);
+    ASSERT_NEAR_(delta.z(), 0.0, 1e-6);
+
+    std::cout << "OK\n";
+}
+
+#if defined(MOLA_KERNEL_NAVSTATE_FILTER_HAS_GEO_REFERENCE)
+// The ENU-to-map transform ends in the map frame, so a change of that frame
+// must carry it along; otherwise later GNSS fixes land in the stale frame.
+void test_transform_frame_updates_geo_reference()
+{
+    std::cout << "[Test] transform_frame() rebases the geo-reference... ";
+
+    mola::state_estimation_simple::StateEstimationSimple est;
+    est.initialize(gnss_config());
+    est.set_geo_reference(identity_georef());
+
+    const auto b = mrpt::poses::CPose3D(1, 2, 3, 30.0_deg, 0.0_deg, 0.0_deg);
+    ASSERT_(est.transform_frame(b));
+
+    const auto g = est.get_geo_reference();
+    ASSERT_(g.has_value());
+    // The datum is a property of the Earth and must be untouched.
+    ASSERT_NEAR_(g->geo_coord.lat.decimal_value, kDatumLat, 1e-12);
+    ASSERT_NEAR_(g->geo_coord.lon.decimal_value, kDatumLon, 1e-12);
+    // T_enu_to_map was identity, so it must now be exactly `b`.
+    ASSERT_NEAR_(g->T_enu_to_map.mean.x(), b.x(), 1e-9);
+    ASSERT_NEAR_(g->T_enu_to_map.mean.y(), b.y(), 1e-9);
+    ASSERT_NEAR_(g->T_enu_to_map.mean.z(), b.z(), 1e-9);
+    ASSERT_NEAR_(g->T_enu_to_map.mean.yaw(), b.yaw(), 1e-9);
+
+    // A GNSS fix at the datum must therefore be placed at the origin of the
+    // NEW map frame, i.e. at `b`'s translation.
+    seed_anchor(est, mrpt::poses::CPose3D(20, 20, 20), 100.0);
+    est.fuse_gnss(make_gps(kDatumLat, kDatumLon, kDatumAlt, 0.05, 0.10, 0.1));
+
+    auto s = est.estimated_navstate(mrpt::Clock::fromDouble(0.05), "map");
+    ASSERT_(s.has_value());
+    ASSERT_NEAR_(s->pose.mean.x(), b.x(), 0.3);
+    ASSERT_NEAR_(s->pose.mean.y(), b.y(), 0.3);
+
+    std::cout << "OK\n";
+}
+#endif
+#endif
+
 }  // namespace
+
+// --------------------------------------------------------------------------
+// Inertial propagation (imu_propagation): after the last pose, the estimate
+// must follow the IMU (turning while accelerating), where the constant-twist
+// model drifts, and must keep predicting past max_time_to_use_velocity_model.
+// --------------------------------------------------------------------------
+namespace
+{
+constexpr double PROP_V0     = 5.0;  // [m/s] initial forward speed (world x)
+constexpr double PROP_ACC_Y  = 3.0;  // [m/s²] constant world-frame acceleration
+constexpr double PROP_WZ     = 0.5;  // [rad/s] constant yaw rate
+constexpr double PROP_T_LAST = 2.0;  // [s] last fused pose
+
+mrpt::poses::CPose3D prop_gt_pose(double t)
+{
+    return mrpt::poses::CPose3D::FromXYZYawPitchRoll(
+        PROP_V0 * t, 0.5 * PROP_ACC_Y * t * t, 0, PROP_WZ * t, 0, 0);
+}
+
+// Feeds poses at 10 Hz up to PROP_T_LAST and IMU readings at 200 Hz up to
+// imuEnd; accelerometer readings only if withAcc.
+void prop_feed(
+    mola::state_estimation_simple::StateEstimationSimple& est, double imuEnd, bool withAcc)
+{
+    for (int i = 0; 0.005 * i <= imuEnd + 1e-9; i++)
+    {
+        const double t = 0.005 * i;
+        // Specific force = R^T (a_world - g), g = (0,0,-9.81):
+        const auto f = prop_gt_pose(t).inverseRotateVector({0, PROP_ACC_Y, 9.81});
+
+        mrpt::obs::CObservationIMU imu;
+        imu.timestamp = mrpt::Clock::fromDouble(t);
+        imu.set(mrpt::obs::IMU_WX, 0.0);
+        imu.set(mrpt::obs::IMU_WY, 0.0);
+        imu.set(mrpt::obs::IMU_WZ, PROP_WZ);
+        if (withAcc)
+        {
+            imu.set(mrpt::obs::IMU_X_ACC, f.x);
+            imu.set(mrpt::obs::IMU_Y_ACC, f.y);
+            imu.set(mrpt::obs::IMU_Z_ACC, f.z);
+        }
+        est.fuse_imu(imu);
+
+        if (i % 20 == 0 && t <= PROP_T_LAST + 1e-9)
+        {
+            mrpt::poses::CPose3DPDFGaussian p;
+            p.mean = prop_gt_pose(t);
+            p.cov.setDiagonal(1e-4);
+            est.fuse_pose(mrpt::Clock::fromDouble(t), p, "map");
+        }
+    }
+}
+
+double prop_error(mola::state_estimation_simple::StateEstimationSimple& est, double t)
+{
+    const auto s = est.estimated_navstate(mrpt::Clock::fromDouble(t), "map");
+    if (!s)
+    {
+        return -1;
+    }
+    return (s->pose.mean.asTPose().translation() - prop_gt_pose(t).asTPose().translation()).norm();
+}
+}  // namespace
+
+void test_imu_propagation()
+{
+    std::cout << "[Test] IMU propagation... ";
+
+    const std::string base = R"###(
+params:
+    max_time_to_use_velocity_model: 0.75
+    sigma_random_walk_acceleration_linear: 1.0
+    sigma_random_walk_acceleration_angular: 1.0
+    sigma_relative_pose_linear: 0.01
+    sigma_relative_pose_angular: 0.01
+    sigma_imu_angular_velocity: 0.05
+)###";
+
+    mola::state_estimation_simple::StateEstimationSimple legacy;
+    legacy.initialize(mrpt::containers::yaml::FromText(base));
+    prop_feed(legacy, 3.5, true);
+
+    mola::state_estimation_simple::StateEstimationSimple inertial;
+    inertial.initialize(mrpt::containers::yaml::FromText(
+        base + "    imu_propagation: true\n    imu_propagation_max_time: 2.0\n"));
+    prop_feed(inertial, 3.5, true);
+
+    const double eLegacy   = prop_error(legacy, PROP_T_LAST + 0.5);
+    const double eInertial = prop_error(inertial, PROP_T_LAST + 0.5);
+    if (VERBOSE)
+    {
+        std::cout << "\n  +0.5 s: constant twist " << eLegacy << " m, inertial " << eInertial
+                  << " m\n";
+    }
+    ASSERT_GE_(eLegacy, 0.0);
+    ASSERT_GE_(eInertial, 0.0);
+    ASSERT_LT_(eInertial, 0.1);
+    ASSERT_LT_(eInertial, 0.5 * eLegacy);
+
+    // Beyond max_time_to_use_velocity_model: only the inertial one predicts.
+    ASSERT_LT_(prop_error(legacy, PROP_T_LAST + 1.2), 0.0);
+    const double eFar = prop_error(inertial, PROP_T_LAST + 1.2);
+    ASSERT_GE_(eFar, 0.0);
+    ASSERT_LT_(eFar, 0.3);
+
+    // Beyond imu_propagation_max_time: nothing.
+    ASSERT_LT_(prop_error(inertial, PROP_T_LAST + 2.1), 0.0);
+
+    // Without accelerometer, or with IMU readings not covering the interval,
+    // it falls back to the constant-twist model:
+    mola::state_estimation_simple::StateEstimationSimple noAcc;
+    noAcc.initialize(mrpt::containers::yaml::FromText(
+        base + "    imu_propagation: true\n    imu_propagation_max_time: 2.0\n"));
+    prop_feed(noAcc, 3.5, false);
+    ASSERT_NEAR_(prop_error(noAcc, PROP_T_LAST + 0.5), eLegacy, 1e-6);
+    ASSERT_LT_(prop_error(noAcc, PROP_T_LAST + 1.2), 0.0);
+
+    mola::state_estimation_simple::StateEstimationSimple shortImu;
+    shortImu.initialize(mrpt::containers::yaml::FromText(
+        base + "    imu_propagation: true\n    imu_propagation_max_time: 2.0\n"));
+    prop_feed(shortImu, PROP_T_LAST + 0.2, true);
+    ASSERT_NEAR_(prop_error(shortImu, PROP_T_LAST + 0.5), eLegacy, 1e-6);
+
+    std::cout << "OK\n";
+}
+
+// An accelerometer bias must be estimated from the poses, not integrated into
+// the velocity: after 10 s of poses, a 1 s prediction stays within centimeters.
+void test_imu_propagation_accel_bias()
+{
+    std::cout << "[Test] IMU propagation, accelerometer bias... ";
+
+    constexpr double BIAS = 0.3;  // [m/s²], along the vehicle x axis
+    constexpr double V0   = 4.0;  // [m/s]
+    constexpr double TEND = 10.0;
+
+    mola::state_estimation_simple::StateEstimationSimple est;
+    est.initialize(mrpt::containers::yaml::FromText(R"###(
+params:
+    max_time_to_use_velocity_model: 0.75
+    sigma_relative_pose_linear: 0.02
+    sigma_relative_pose_angular: 0.01
+    imu_propagation: true
+    imu_propagation_max_time: 2.0
+)###"));
+
+    const auto gt = [](double t)
+    { return mrpt::poses::CPose3D::FromXYZYawPitchRoll(V0 * t, 0, 0, 0, 0, 0); };
+
+    for (int i = 0; 0.005 * i <= TEND + 1.5; i++)
+    {
+        const double               t = 0.005 * i;
+        mrpt::obs::CObservationIMU imu;
+        imu.timestamp = mrpt::Clock::fromDouble(t);
+        imu.set(mrpt::obs::IMU_WX, 0.0);
+        imu.set(mrpt::obs::IMU_WY, 0.0);
+        imu.set(mrpt::obs::IMU_WZ, 0.0);
+        imu.set(mrpt::obs::IMU_X_ACC, BIAS);
+        imu.set(mrpt::obs::IMU_Y_ACC, 0.0);
+        imu.set(mrpt::obs::IMU_Z_ACC, 9.81);
+        est.fuse_imu(imu);
+
+        if (i % 20 == 0 && t <= TEND + 1e-9)
+        {
+            mrpt::poses::CPose3DPDFGaussian p;
+            p.mean = gt(t);
+            p.cov.setDiagonal(1e-4);
+            est.fuse_pose(mrpt::Clock::fromDouble(t), p, "map");
+        }
+    }
+
+    const auto s = est.estimated_navstate(mrpt::Clock::fromDouble(TEND + 1.0), "map");
+    ASSERT_(s.has_value());
+    const double err =
+        (s->pose.mean.asTPose().translation() - gt(TEND + 1.0).asTPose().translation()).norm();
+    if (VERBOSE)
+    {
+        std::cout << "\n  +1.0 s error: " << err << " m (unestimated bias would give ~0.15 m)\n";
+    }
+    ASSERT_LT_(err, 0.05);
+    std::cout << "OK\n";
+}
+
+// A 3D-odometry update moves the pose anchor to its own time, while the IMU
+// velocity still refers to the last LiDAR pose: propagation must not be used
+// from that anchor (it falls back to the constant-twist model), and must be
+// used again after the next LiDAR pose.
+void test_imu_propagation_after_3d_odometry()
+{
+    std::cout << "[Test] IMU propagation after 3D odometry... ";
+
+    mola::state_estimation_simple::StateEstimationSimple est;
+    est.initialize(mrpt::containers::yaml::FromText(R"###(
+params:
+    max_time_to_use_velocity_model: 0.75
+    sigma_relative_pose_linear: 0.01
+    sigma_relative_pose_angular: 0.01
+    imu_propagation: true
+    imu_propagation_max_time: 2.0
+)###"));
+    prop_feed(est, 3.5, true);
+
+    // Inertial prediction: its rotation variance is the tiny gyro one.
+    const auto rotVarAt = [&](double t)
+    {
+        const auto s = est.estimated_navstate(mrpt::Clock::fromDouble(t), "map");
+        ASSERT_(s.has_value());
+        return 1.0 / s->pose.cov_inv(3, 3);
+    };
+    const double inertialRotVar = rotVarAt(PROP_T_LAST + 0.3);
+
+    auto odom         = mrpt::obs::CObservationRobotPose::Create();
+    odom->timestamp   = mrpt::Clock::fromDouble(PROP_T_LAST + 0.1);
+    odom->sensorLabel = "wheel_odom";
+    odom->pose.mean   = prop_gt_pose(PROP_T_LAST + 0.1);
+    odom->pose.cov.setDiagonal(1e-4);
+    est.onNewObservation(odom);
+
+    // After the odometry update: constant-twist model, much larger variance.
+    ASSERT_GT_(rotVarAt(PROP_T_LAST + 0.3), 10 * inertialRotVar);
+
+    std::cout << "OK\n";
+}
 
 int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
 {
@@ -1174,6 +1850,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     {
         test_pose_and_twist();
         test_odometry_fusion();
+        test_pre_anchor_odometry_discarded();
         test_imu_angular_velocity();
         test_planar_motion();
         test_gnss_ignored();
@@ -1183,6 +1860,13 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         test_multirate_interleaved_velocity();
         test_imu_arrival_order_independence();
         test_imu_survives_reset();
+        test_initial_twist_seed();
+        test_partial_observation_bootstraps_independently();
+        test_real_measurement_survives_first_fuse_pose();
+        test_initial_twist_invalid_sigma_rejected();
+        test_imu_propagation();
+        test_imu_propagation_accel_bias();
+        test_imu_propagation_after_3d_odometry();
 #if defined(MOLA_KERNEL_NAVSTATE_FILTER_HAS_GEO_REFERENCE)
         test_gnss_rtk_pulls_anchor();
         test_gnss_gated_out();
@@ -1192,6 +1876,12 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         test_gnss_disabled_ignores();
         test_gnss_bad_covariance_rejected();
         test_gnss_significant_3d_lever_arm();
+#endif
+#if defined(MOLA_KERNEL_NAVSTATE_FILTER_HAS_TRANSFORM_FRAME)
+        test_transform_frame_leaves_odometry_frame_alone();
+#if defined(MOLA_KERNEL_NAVSTATE_FILTER_HAS_GEO_REFERENCE)
+        test_transform_frame_updates_geo_reference();
+#endif
 #endif
 
         std::cout << "\nAll StateEstimationSimple tests passed!\n";

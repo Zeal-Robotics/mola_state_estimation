@@ -131,6 +131,13 @@ class StateEstimationSimple : public mola::NavStateFilter
     std::optional<mola::Georeferencing> get_geo_reference() const override;
 #endif
 
+#if defined(MOLA_KERNEL_NAVSTATE_FILTER_HAS_TRANSFORM_FRAME)
+    /** Re-expresses the stored poses in a new reference frame (`p` -> `b + p`).
+     *  Every velocity held here is in the vehicle's own frame, so a change of
+     *  the map frame leaves the twist and its covariance untouched. */
+    bool transform_frame(const mrpt::poses::CPose3D& b) override;
+#endif
+
     /** Integrates new twist estimation (in the odom frame) */
     void fuse_twist(
         const mrpt::Clock::time_point& timestamp, const mrpt::math::TTwist3D& twist,
@@ -171,6 +178,14 @@ class StateEstimationSimple : public mola::NavStateFilter
         // Indices 0-2: linear (vx,vy,vz), 3-5: angular (wx,wy,wz).
         std::array<double, 6> vel_filter_P = {1e4, 1e4, 1e4, 1e4, 1e4, 1e4};
 
+        // Whether each component's vel_filter_P above came from
+        // seedInitialTwistFromParams() rather than the uninformative default.
+        // Needed to tell apart, on a component's first-ever observation,
+        // whether it must blend with a real seed or bootstrap outright: once
+        // ANY component has been observed, state_.last_twist itself is no
+        // longer a reliable "was this seeded" signal for the OTHER components.
+        std::array<bool, 6> vel_filter_seeded = {false, false, false, false, false, false};
+
         // Per-component last-update time. Each velocity component keeps its own
         // clock so sources with very different rates and timestamp conventions
         // do not starve each other: a source only advances the clock of the
@@ -190,6 +205,14 @@ class StateEstimationSimple : public mola::NavStateFilter
         {
             std::optional<mrpt::poses::CPose3DPDFGaussian> last_pose;
             std::optional<mrpt::Clock::time_point>         last_obs_tim;
+
+            // Which frame `last_pose` is expressed in. Localization sources
+            // (fuse_pose) are in the map frame; 3D odometry sources keep their
+            // own, potentially offset, odometry frame. A change of the map
+            // frame must only be applied to the former: the latter keeps
+            // receiving observations in its original frame, and rebasing the
+            // stored anchor would corrupt the next delta.
+            bool in_map_frame = true;
         };
         std::map<std::string, SourceState> per_source;
 
@@ -208,6 +231,54 @@ class StateEstimationSimple : public mola::NavStateFilter
         // would silently discard data that used to be fused.
         std::multimap<mrpt::Clock::time_point, PendingImu> pending_imu;
 
+        // Recent IMU readings (vehicle frame) kept for inertial propagation
+        // (Parameters::imu_propagation). Unlike pending_imu, these are not
+        // consumed by fusion: every query re-integrates them from the last pose.
+        struct ImuSample
+        {
+            mrpt::math::TVector3D w;  // angular velocity [rad/s]
+            mrpt::math::TVector3D f;  // specific force (accelerometer) [m/s²]
+        };
+        std::multimap<mrpt::Clock::time_point, ImuSample> imu_history;
+
+        // Velocity at last_pose_obs_tim, and a slowly varying acceleration
+        // bias, both in the reference frame: estimated by propagating with the
+        // accelerometer between poses and correcting with each new pose (see
+        // update_imu_velocity()). The bias absorbs the accelerometer bias and
+        // the gravity that leaks through attitude errors, which would otherwise
+        // be integrated into the velocity. Only with imu_propagation.
+        std::optional<mrpt::math::TVector3D> imu_velocity;
+        // The instant imu_velocity refers to: the pose update that last set it.
+        // Other updates of last_pose (3D odometry, a second pose source) do
+        // not move it, so propagation is only used from that same instant.
+        std::optional<mrpt::Clock::time_point> imu_velocity_tim;
+        mrpt::math::TVector3D                  imu_accel_bias = {0, 0, 0};
+        // Covariance of (velocity, bias), the same for the three axes:
+        double imu_P_vv = 0;
+        double imu_P_vb = 0;
+        double imu_P_bb = 0;
+
+        // An odometry reading waiting to be fused. Either flavor is kept as the
+        // observation itself, since fusing it re-reads several of its fields.
+        struct PendingOdometry
+        {
+            mrpt::obs::CObservation::ConstPtr obs;
+            std::string                       name;
+        };
+
+        // Odometry readings waiting to be fused, for the same reason as
+        // pending_imu above: without this, whether a reading is applied before
+        // or after a scan's fuse_pose() is decided by which thread ran first.
+        //
+        // Keyed by (timestamp, source name) rather than timestamp alone: two
+        // sources can share an instant, and both handlers mutate last_pose and
+        // the twist filter, so ordering those ties by insertion (i.e. by
+        // arrival) would put the delivery-order dependence straight back. The
+        // name is a stable property of the input. Still a multimap, so two
+        // readings from one source at one instant are both kept.
+        std::multimap<std::pair<mrpt::Clock::time_point, std::string>, PendingOdometry>
+            pending_odometry;
+
         // To be built from parameters strings when changed.
         RegexCache do_process_imu_labels_re;
         RegexCache do_process_odometry_labels_re;
@@ -222,6 +293,11 @@ class StateEstimationSimple : public mola::NavStateFilter
     void fuse_odometry_3d_pose(
         const mrpt::obs::CObservationRobotPose& obs, const std::string& odomName);
 
+    /** If params.initial_twist is non-zero, seeds state_.last_twist (and its
+     *  covariance) with it. Called from initialize() and reset(). Must be
+     *  called with state_mtx_ already held. */
+    void seedInitialTwistFromParams();
+
     /** Applies a scalar Kalman predict+update step to each velocity component.
      *  When velocity_filter_enabled is false this is a plain write-through.
      *  Must be called with state_mtx_ already held. */
@@ -234,9 +310,65 @@ class StateEstimationSimple : public mola::NavStateFilter
      *  Must be called with state_mtx_ already held. */
     void fuse_pending_imu_up_to(const mrpt::Clock::time_point& upTo);
 
+    /** Strapdown integration of the IMU readings in imu_history over (t0, t1],
+     *  from orientation R0 and velocity v0 (both in the reference frame).
+     *  Returns nullopt if the readings do not cover the interval.
+     *  Must be called with state_mtx_ already held. */
+    struct Integration
+    {
+        mrpt::math::TVector3D       displacement;  // reference frame
+        mrpt::math::TVector3D       velocity;  // reference frame, at t1
+        mrpt::math::CMatrixDouble33 rotation;  // at t1
+    };
+    std::optional<Integration> imu_integrate(
+        const mrpt::math::CMatrixDouble33& R0, const mrpt::math::TVector3D& v0,
+        const mrpt::Clock::time_point& t0, const mrpt::Clock::time_point& t1) const;
+
+    /** Propagates the last fused pose to `timestamp` (see
+     *  Parameters::imu_propagation). Returns the pose increment from last_pose,
+     *  expressed in its own frame, and the linear velocity at `timestamp` in
+     *  the vehicle frame, or nullopt if that is not possible.
+     *  Must be called with state_mtx_ already held. */
+    struct Propagation
+    {
+        mrpt::poses::CPose3D  increment;
+        mrpt::math::TVector3D velocity_body;
+    };
+    std::optional<Propagation> imu_propagate(const mrpt::Clock::time_point& timestamp) const;
+
+    /** With imu_propagation, updates imu_velocity with a new pose of the
+     *  primary localization source, before last_pose is overwritten.
+     *  Must be called with state_mtx_ already held. */
+    void update_imu_velocity(
+        const mrpt::poses::CPose3D& prevPose, const mrpt::Clock::time_point& prevTime,
+        const mrpt::poses::CPose3D& newPose, const mrpt::Clock::time_point& newTime);
+
     /** Fuses every buffered IMU reading, whatever its timestamp.
      *  Must be called with state_mtx_ already held. */
     void fuse_all_pending_imu();
+
+    /** Stores an incoming odometry observation (either flavor) for later,
+     *  timestamp-ordered fusion. Takes state_mtx_ itself. */
+    void bufferPendingOdometry(
+        const mrpt::obs::CObservation::ConstPtr& obs, const std::string& odomName);
+
+    /** Fuses the buffered odometry readings with a timestamp not newer than
+     *  `upTo`, in timestamp order, and drops them from the buffer. Each one
+     *  fuses the IMU readings preceding it first, so the two streams end up
+     *  interleaved by timestamp.
+     *  Must be called with state_mtx_ already held. */
+    void fuse_pending_odometry_up_to(const mrpt::Clock::time_point& upTo);
+
+    /** Fuses every buffered odometry reading, whatever its timestamp.
+     *  Must be called with state_mtx_ already held. */
+    void fuse_all_pending_odometry();
+
+    /** Bodies of fuse_odometry() / fuse_odometry_3d_pose() without taking
+     *  state_mtx_, so the buffered path can call them while holding it. */
+    void fuse_odometry_locked(
+        const mrpt::obs::CObservationOdometry& odom, const std::string& odomName);
+    void fuse_odometry_3d_pose_locked(
+        const mrpt::obs::CObservationRobotPose& obs, const std::string& odomName);
 
     State state_;
 

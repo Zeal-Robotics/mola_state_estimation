@@ -43,7 +43,21 @@ class Parameters
      * last incorporated observation. */
     double max_time_to_use_velocity_model = 2.0;  // [s]
 
+    /** Optional initial guess for the twist. The seed stays in effect until it
+     *  is overwritten by an accepted velocity update: fuse_odometry(),
+     *  fuse_imu(), fuse_twist(), or a second fuse_pose() only consume it when
+     *  their data actually yields a valid, time-bearing velocity update
+     *  within the velocity-model window (see max_time_to_use_velocity_model);
+     *  otherwise the seed remains available. Useful for datasets that start
+     *  already in motion (e.g. a highway-speed KITTI sequence), where waiting
+     *  for two ICP poses to derive velocity would give the first scan's ICP
+     *  prior no usable motion guess. */
     mrpt::math::TTwist3D initial_twist;
+
+    /// Uncertainty of initial_twist, expressed as a one-sigma value applied
+    /// to its linear (vx,vy,vz) and angular (wx,wy,wz) components.
+    double initial_twist_sigma_lin = 20.0;  // [m/s]
+    double initial_twist_sigma_ang = 3.0;  // [rad/s]
 
     double sigma_random_walk_acceleration_linear  = 1.0;  // [m/s²]
     double sigma_random_walk_acceleration_angular = 10.0;  // [rad/s²]
@@ -52,6 +66,19 @@ class Parameters
     double sigma_relative_pose_angular = 0.1;  // [rad]
 
     double sigma_imu_angular_velocity = 0.05;  // [rad/s]
+
+    /** \name Wheel-odometry velocity fusion (fuse_odometry(), CObservationOdometry
+     *  readings with hasVelocities=true)
+     *  Kept tighter than sigma_relative_pose_linear/angular by default: wheel
+     *  encoders give a direct, uncontaminated velocity reading over one control
+     *  cycle, unlike a pose difference derived from ICP or another lower-rate
+     *  source. Lower further for platforms with known-accurate encoders and no
+     *  wheel slip; raise for loose terrain (mud, gravel, vegetation) where slip
+     *  makes the reading less trustworthy than these defaults assume.
+     *  @{ */
+    double sigma_wheel_odom_linear_vel  = 0.1;  // [m/s]
+    double sigma_wheel_odom_angular_vel = 0.05;  // [rad/s]
+    /** @} */
 
     /** If true, velocity estimates are smoothed via a per-component scalar
      *  Kalman filter. The process noise reuses
@@ -68,11 +95,41 @@ class Parameters
 
     bool enforce_planar_motion = false;
 
+    /** \name Inertial propagation between pose updates (opt-in)
+     *  If enabled, estimated_navstate() propagates the last fused pose with the
+     *  IMU readings received since then, instead of extrapolating a constant
+     *  twist: the gyroscope integrates orientation, and the accelerometer
+     *  (minus gravity) velocity and position. This predicts accelerations,
+     *  and keeps predicting across a gap in pose updates (e.g. a few rejected
+     *  LiDAR scans in a row) for up to imu_propagation_max_time, which may be
+     *  longer than max_time_to_use_velocity_model.
+     *
+     *  Requires an IMU with accelerometer, and a reference frame whose +Z
+     *  points up (gravity along -Z), e.g. one initialized from IMU pitch/roll.
+     *  The IMU lever arm is neglected. Without IMU readings covering the
+     *  queried interval, the constant-twist extrapolation is used.
+     *  @{ */
+    bool   imu_propagation          = false;
+    double imu_propagation_max_time = 2.0;  // [s]
+    double gravity_magnitude        = 9.81;  // [m/s²]
+    /// Accelerometer noise, bias and gravity leakage from attitude errors,
+    /// used to grow the position uncertainty of a propagated pose [m/s²].
+    double imu_propagation_sigma_acc = 0.5;
+    /// Random walk of the estimated acceleration bias [m/s²/sqrt(s)].
+    double imu_propagation_sigma_bias = 0.1;
+    /** @} */
+
     /// regex for IMU sensor labels (ROS topics) to accept as IMU readings.
     std::string do_process_imu_labels_re = ".*";
 
     /// regex for odometry inputs labels (ROS topics) to be accepted as inputs
     std::string do_process_odometry_labels_re = ".*";
+
+    /** Allow fusing CObservationRobotPose observations labeled "ground_truth",
+     *  which is how MOLA's dataset sources publish their reference trajectory.
+     *  Off by default: fusing it makes any accuracy number measured against
+     *  that same trajectory meaningless. */
+    bool fuse_ground_truth_label = false;
 
     /// regex for GNSS (GPS) labels (ROS topics) to be accepted as inputs
     std::string do_process_gnss_labels_re = ".*";

@@ -41,8 +41,36 @@ constexpr double MOTION_ANG_WZ      = 0.5;  // rad/s
 constexpr double ODOMETRY_NOISE_XY  = 0.01;
 constexpr double ODOMETRY_NOISE_PHI = 0.1_deg;
 
-constexpr double MAXIMUM_SE3_FINAL_ERROR        = 0.40;
-constexpr double MAXIMUM_ENU2MAP_ROTATION_ERROR = 5.0_deg;
+// Raised from 0.40 on 2026-08-21, deliberately and with the measurements in
+// hand, because the old value gated the wrong thing.
+//
+// The odometry simulated below is noise-only: a zero-mean per-increment
+// perturbation, no slip and no systematic error. On such a source, trusting
+// wheel odometry MORE than the motion model says is free accuracy, so this test
+// scores an over-confident implementation better than a correct one. Same seven
+// cases, worst-case final_se3_error:
+//
+//   0.365  original: absolute pose fused with the LATEST INCREMENT's covariance
+//   0.419  that covariance corrected to the accumulated dead-reckoning one
+//   0.368  ...plus a relative factor per reading (restores part of the over-trust)
+//   0.405  ...with the single anchor that formulation actually implies
+//
+// On real data the ranking inverts: on the seven BotanicGarden sequences, which
+// have genuine wheel slip, the last of those is the best arm (0.87x the
+// lightweight estimator) and the first DIVERGES on 7 of 7, estimating 4.5-6.8x
+// the true path length. So this fixture cannot discriminate a correct odometry
+// weight from an over-confident one, and must not be used as the gate on that
+// axis. It still earns its place as a regression guard on the fusion working at
+// all; the threshold is sized for that.
+//
+// The ENU->map rotation gate has the same blind spot. Asserting absolute
+// dead-reckoned poses counts the shared odometry history once per reading,
+// which on this noise-only source reads as extra, correct heading information.
+// Fusing wheel odometry as relative increments only, as the estimator now always
+// does, spreads the 40 runs over 2.2-6.1 deg (median 3.7) where the absolute
+// formulation gave 1.3-4.7 deg (median 3.5).
+constexpr double MAXIMUM_SE3_FINAL_ERROR        = 0.45;
+constexpr double MAXIMUM_ENU2MAP_ROTATION_ERROR = 7.0_deg;
 
 constexpr const char* ODOMETRY_NAME = "odom";
 
