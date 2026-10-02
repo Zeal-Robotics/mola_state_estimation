@@ -210,6 +210,19 @@ void test_prediction_runs_past_the_last_odometry_reading()
     ASSERT_(late.has_value());
     ASSERT_NEAR_(late->pose.mean.x(), SPEED * 1.21, 2e-3);
 
+    // A LiDAR pose fused between two readings: the motion from the reading
+    // before it is already in that pose, so it must not be added again.
+    estimator.fuse_pose(
+        mrpt::Clock::fromDouble(1.23),
+        mrpt::poses::CPose3DPDFGaussian(
+            mrpt::poses::CPose3D(SPEED * 1.23, 0, 0, 0, 0, 0),
+            mrpt::math::CMatrixDouble66::Identity()),
+        "map");
+    feed(31, 33);  // up to 1.32 s
+    const auto after = estimator.estimated_navstate(mrpt::Clock::fromDouble(1.33), "map");
+    ASSERT_(after.has_value());
+    ASSERT_NEAR_(after->pose.mean.x(), SPEED * 1.33, 2e-3);
+
     std::cout << "OK\n";
 }
 

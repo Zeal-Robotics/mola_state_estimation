@@ -1180,6 +1180,22 @@ void StateEstimationSimple::fuse_pose(
     state_.last_pose                      = pose;
     state_.last_pose_obs_tim              = timestamp;
     state_.pose_already_updated_with_odom = false;
+
+    // The next odometry increment is added to this pose, so it has to start
+    // at this pose's time. The baseline is the last reading at or before it:
+    // the motion from that reading to now is already in the pose, and would
+    // be counted twice. Carry the baseline forward with the wheels' velocity.
+    if (state_.last_odom_obs && state_.last_odom_obs->hasVelocities)
+    {
+        auto&        base = *state_.last_odom_obs;
+        const double dt   = mrpt::system::timeDifference(base.timestamp, timestamp);
+        if (dt > 0)
+        {
+            const auto& v = base.velocityLocal;
+            base.odometry = base.odometry + mrpt::poses::CPose2D(v.vx * dt, v.vy * dt, v.omega * dt);
+            base.timestamp = timestamp;
+        }
+    }
 }
 
 namespace
