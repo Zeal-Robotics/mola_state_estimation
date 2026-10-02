@@ -1284,7 +1284,14 @@ std::optional<NavState> StateEstimationSimple::estimated_navstate(
         return {};  // None
     }
 
-    const double dt = mrpt::system::timeDifference(*state_.last_pose_obs_tim, timestamp);
+    // The pose is current as of the last pose fused, or of the last odometry reading that moved
+    // it since: the motion still to extrapolate runs from there. Its uncertainty, though, has
+    // grown since the last pose fused, which the odometry increments do not reset.
+    const auto stateStamp = state_.pose_already_updated_with_odom && state_.last_odom_obs
+                                ? state_.last_odom_obs->timestamp
+                                : *state_.last_pose_obs_tim;
+    const double dt         = mrpt::system::timeDifference(stateStamp, timestamp);
+    const double dtSinceFix = mrpt::system::timeDifference(*state_.last_pose_obs_tim, timestamp);
 
     // Inertial propagation, if enabled and the IMU readings cover the interval.
     // It may extrapolate further than the constant-twist model:
@@ -1309,14 +1316,8 @@ std::optional<NavState> StateEstimationSimple::estimated_navstate(
     {
         poseExtrapolation = propagated->increment;
     }
-    else if (state_.pose_already_updated_with_odom)
-    {
-        // We have already updated the pose via wheels odometry, don't
-        // extrapolate:
-        poseExtrapolation = mrpt::poses::CPose3D::Identity();
-    }
     else
-    {  // normal case: use twist to extrapolate:
+    {  // the twist extrapolates from the pose fused, or from the odometry reading after it:
 
         const auto& tw = state_.last_twist.value();
 
@@ -1342,8 +1343,8 @@ std::optional<NavState> StateEstimationSimple::estimated_navstate(
     // pose cov:
     auto cov = state_.last_pose->cov;
 
-    double varXYZ = mrpt::square(dt * params.sigma_random_walk_acceleration_linear);
-    double varRot = mrpt::square(dt * params.sigma_random_walk_acceleration_angular);
+    double varXYZ = mrpt::square(dtSinceFix * params.sigma_random_walk_acceleration_linear);
+    double varRot = mrpt::square(dtSinceFix * params.sigma_random_walk_acceleration_angular);
     if (propagated)
     {
         // Position: the initial velocity uncertainty, plus the accelerometer

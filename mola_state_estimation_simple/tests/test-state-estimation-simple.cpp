@@ -157,6 +157,63 @@ void test_odometry_fusion()
 }
 
 // --------------------------------------------------------------------------
+// Test 2a: The prediction runs past the last odometry reading
+// --------------------------------------------------------------------------
+// Wheel odometry moves the pose between LiDAR poses, but its readings rarely
+// land on the instant a scan is predicted for. The motion from the last
+// reading to that instant is extrapolated with the wheels' twist, and the
+// prediction stays valid however old the last LiDAR pose is while the
+// odometry keeps the pose current.
+void test_prediction_runs_past_the_last_odometry_reading()
+{
+    std::cout << "[Test 2a] Prediction past the last odometry reading... ";
+
+    auto cfg = get_default_config();
+    cfg["params"]["max_time_to_use_velocity_model"] = 0.75;
+    mola::state_estimation_simple::StateEstimationSimple estimator;
+    estimator.initialize(cfg);
+
+    estimator.fuse_pose(
+        mrpt::Clock::fromDouble(0.0),
+        mrpt::poses::CPose3DPDFGaussian(
+            mrpt::poses::CPose3D::Identity(), mrpt::math::CMatrixDouble66::Identity()),
+        "map");
+
+    // 25 Hz wheel odometry of a vehicle doing 1 m/s straight ahead:
+    constexpr double SPEED = 1.0;  // [m/s]
+    constexpr double PERIOD = 0.04;  // [s]
+    const auto feed = [&](int from, int to)
+    {
+        for (int k = from; k <= to; k++)
+        {
+            const double t = PERIOD * k;
+            mrpt::obs::CObservationOdometry odom;
+            odom.timestamp           = mrpt::Clock::fromDouble(t);
+            odom.odometry            = mrpt::poses::CPose2D(SPEED * t, 0, 0);
+            odom.hasVelocities       = true;
+            odom.velocityLocal.vx    = SPEED;
+            odom.velocityLocal.omega = 0.0;
+            estimator.onNewObservation(std::make_shared<const mrpt::obs::CObservationOdometry>(odom));
+        }
+    };
+
+    // Between readings: the last one at or before 0.07 s is at 0.04 s.
+    feed(0, 2);  // up to 0.08 s
+    const auto between = estimator.estimated_navstate(mrpt::Clock::fromDouble(0.07), "map");
+    ASSERT_(between.has_value());
+    ASSERT_NEAR_(between->pose.mean.x(), SPEED * 0.07, 2e-3);
+
+    // 1.2 s after the only LiDAR pose, beyond max_time_to_use_velocity_model,
+    // with the odometry current: still a prediction, at the odometry's place.
+    feed(3, 30);  // up to 1.2 s
+    const auto late = estimator.estimated_navstate(mrpt::Clock::fromDouble(1.21), "map");
+    ASSERT_(late.has_value());
+    ASSERT_NEAR_(late->pose.mean.x(), SPEED * 1.21, 2e-3);
+
+    std::cout << "OK\n";
+}
+
+// --------------------------------------------------------------------------
 // Test 2b: Pre-anchor odometry is discarded, not carried across fuse_pose()
 // --------------------------------------------------------------------------
 // Odometry can start streaming before the first LiDAR pose is ever fused
@@ -1850,6 +1907,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     {
         test_pose_and_twist();
         test_odometry_fusion();
+        test_prediction_runs_past_the_last_odometry_reading();
         test_pre_anchor_odometry_discarded();
         test_imu_angular_velocity();
         test_planar_motion();
