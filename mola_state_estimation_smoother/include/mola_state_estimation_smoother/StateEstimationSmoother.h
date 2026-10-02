@@ -452,6 +452,9 @@ class StateEstimationSmoother : public mola::NavStateFilter,
     /// solve; queried by estimated_navstate()/spinOnce() without stateMutex_.
     std::unique_ptr<FastPredictor> fastPredictor_;
 
+    /// The stamp of the last timely pose spinOnce() published in async mode.
+    std::optional<mrpt::Clock::time_point> lastTimelyStamp_;
+
     /// Builds an immutable Snapshot of the current solution (newest keyframe
     /// anchor + frame transforms + georef). Assumes stateMutex_ is held.
     /// Returns nullptr if there is no keyframe/state to snapshot yet.

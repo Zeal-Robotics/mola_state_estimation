@@ -24,6 +24,10 @@
 #include <mola_state_estimation_smoother/Parameters.h>
 #include <mrpt/core/Clock.h>
 
+#include <mrpt/math/TTwist3D.h>
+#include <mrpt/poses/CPose3D.h>
+
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -44,6 +48,13 @@ namespace mola::state_estimation_smoother
  *  odometry-frame query anchors on that source's own last raw pose, never on a
  *  {map}-frame reconstruction.
  *
+ *  Where wheel odometry is fused, a {map}-frame query does not extrapolate the
+ *  anchor: the vehicle's motion since the anchor is known from the odometry
+ *  itself, read at full rate, so the pose is the solved T_map_to_odom composed
+ *  with the odometry at the queried time. Extrapolating the anchor instead
+ *  carries the pose over the backend's solve lag on a velocity estimate, which
+ *  trails every change of speed or turn rate by that lag.
+ *
  *  Thread-safety: its own mutex, deliberately separate from the smoother's
  *  `stateMutex_`, so a query never blocks on a backend batch solve.
  */
@@ -63,9 +74,25 @@ class FastPredictor
     /// touching the smoother's stateMutex_.
     void note_observation_stamp(const mrpt::Clock::time_point& obsStamp);
 
+    /// Records one wheel odometry reading of the source `frameName`: every
+    /// reading as it arrives, before any decimation, with its pose in that
+    /// source's own frame.
+    void note_raw_odometry(
+        const std::string& frameName, const mrpt::Clock::time_point& stamp,
+        const mrpt::poses::CPose3D& poseInOdom);
+
     /// Real-time "now" stamp: the latest observation stamp advanced by the
     /// wallclock elapsed since it was received. nullopt if none seen yet.
     [[nodiscard]] std::optional<mrpt::Clock::time_point> get_current_extrapolated_stamp() const;
+
+    /// The time a timely pose is published for: the real-time "now", held back
+    /// to the newest wheel odometry reading while there is one no older than
+    /// `max_time_to_use_velocity_model`. Inputs reach the estimator in bursts
+    /// when the host is busy, and a pose for a "now" the odometry has not
+    /// reached yet is carried there on a velocity estimate, to be contradicted
+    /// when the readings arrive. For the newest reading it is exact.
+    [[nodiscard]] std::optional<mrpt::Clock::time_point> get_timely_stamp(
+        const Parameters& params) const;
 
     /// Extrapolates the snapshot anchor to `t_query` in `frame_id`. nullopt if
     /// there is no valid snapshot, the frame is unknown, or `t_query` is beyond
@@ -87,6 +114,27 @@ class FastPredictor
 
     std::optional<mrpt::Clock::time_point> lastObsStamp_;
     mrpt::Clock::time_point                lastObsWallclock_;
+
+    struct RawOdometry
+    {
+        mrpt::Clock::time_point stamp;
+        mrpt::poses::CPose3D    pose;  //!< in {odom_i}
+    };
+    /// The recent wheel odometry readings of rawOdometryFrame_, oldest first.
+    std::deque<RawOdometry> rawOdometry_;
+    std::string             rawOdometryFrame_;
+
+    /// The vehicle pose in {map} at `t_query` through the wheel odometry:
+    /// `snap`'s T_map_to_odom composed with the odometry at that time,
+    /// interpolated between readings or carried past the newest one by `twist`.
+    /// nullopt when the odometry does not reach `t_query`: none received, the
+    /// newest reading older than `max_time_to_use_velocity_model`, `t_query`
+    /// older than the history, or the source's frame not solved yet. The
+    /// anchor's stamp plays no part: the newest keyframe is often one no
+    /// odometry increment reaches yet, placed by the kinematic factor alone.
+    [[nodiscard]] std::optional<mrpt::poses::CPose3D> pose_through_odometry(
+        const Snapshot& snap, const Parameters& params, const mrpt::Clock::time_point& t_query,
+        const mrpt::math::TTwist3D& twist) const;
 };
 
 }  // namespace mola::state_estimation_smoother

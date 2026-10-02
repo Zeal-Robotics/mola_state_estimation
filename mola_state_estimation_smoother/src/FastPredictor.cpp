@@ -26,12 +26,21 @@
 #include <mrpt/poses/CPose3DPDFGaussianInf.h>
 #include <mrpt/system/datetime.h>  // timeDifference
 
+#include <mrpt/poses/Lie/SE.h>
+
+#include <algorithm>
 #include <cmath>
 
 #include "extrapolation.h"
 
 namespace mola::state_estimation_smoother
 {
+
+namespace
+{
+/// How far back the wheel odometry is kept: longer than any query lags the newest reading.
+constexpr double RAW_ODOMETRY_HISTORY = 2.0;  // [s]
+}  // namespace
 
 void FastPredictor::set_snapshot(std::shared_ptr<const Snapshot> snap)
 {
@@ -69,11 +78,107 @@ std::optional<mrpt::Clock::time_point> FastPredictor::get_current_extrapolated_s
         mrpt::Clock::toDouble(*lastObsStamp_));
 }
 
+std::optional<mrpt::Clock::time_point> FastPredictor::get_timely_stamp(
+    const Parameters& params) const
+{
+    const auto now = get_current_extrapolated_stamp();
+    std::lock_guard<std::mutex> lck(mtx_);
+    if (!now || rawOdometry_.empty())
+    {
+        return now;
+    }
+    const double ahead = mrpt::system::timeDifference(rawOdometry_.back().stamp, *now);
+    if (ahead <= 0 || ahead > params.max_time_to_use_velocity_model)
+    {
+        return now;
+    }
+    return rawOdometry_.back().stamp;
+}
+
+void FastPredictor::note_raw_odometry(
+    const std::string& frameName, const mrpt::Clock::time_point& stamp,
+    const mrpt::poses::CPose3D& poseInOdom)
+{
+    std::lock_guard<std::mutex> lck(mtx_);
+    // Another source, or one that restarted: its poses do not continue the history.
+    if (frameName != rawOdometryFrame_ ||
+        (!rawOdometry_.empty() &&
+         mrpt::system::timeDifference(rawOdometry_.back().stamp, stamp) <= 0))
+    {
+        rawOdometry_.clear();
+        rawOdometryFrame_ = frameName;
+    }
+    rawOdometry_.push_back({stamp, poseInOdom});
+    while (mrpt::system::timeDifference(rawOdometry_.front().stamp, stamp) > RAW_ODOMETRY_HISTORY)
+    {
+        rawOdometry_.pop_front();
+    }
+}
+
+std::optional<mrpt::poses::CPose3D> FastPredictor::pose_through_odometry(
+    const Snapshot& snap, const Parameters& params, const mrpt::Clock::time_point& t_query,
+    const mrpt::math::TTwist3D& twist) const
+{
+    std::lock_guard<std::mutex> lck(mtx_);
+    if (rawOdometry_.empty())
+    {
+        return std::nullopt;
+    }
+    const auto& str2id = snap.frameNames.getDirectMap();
+    const auto  itName = str2id.find(rawOdometryFrame_);
+    if (itName == str2id.end())
+    {
+        return std::nullopt;
+    }
+    const auto itFrame = snap.frameTransforms.find(itName->second);
+    if (itFrame == snap.frameTransforms.end())
+    {
+        return std::nullopt;
+    }
+    const auto& newest = rawOdometry_.back();
+    if (mrpt::system::timeDifference(rawOdometry_.front().stamp, t_query) < 0)
+    {
+        return std::nullopt;
+    }
+
+    mrpt::poses::CPose3D inOdom;
+    if (const double past = mrpt::system::timeDifference(newest.stamp, t_query); past >= 0)
+    {
+        if (past > params.max_time_to_use_velocity_model)
+        {
+            return std::nullopt;
+        }
+        inOdom = newest.pose + body_twist_delta(params, twist, past);
+    }
+    else
+    {
+        // The first reading after t_query, and the one before it.
+        const auto after = std::lower_bound(
+            rawOdometry_.begin(), rawOdometry_.end(), t_query,
+            [](const RawOdometry& r, const mrpt::Clock::time_point& t) { return r.stamp < t; });
+        if (after == rawOdometry_.begin())
+        {
+            inOdom = after->pose;
+        }
+        else
+        {
+            const auto&  before = *std::prev(after);
+            const double span   = mrpt::system::timeDifference(before.stamp, after->stamp);
+            const double alpha  = mrpt::system::timeDifference(before.stamp, t_query) / span;
+            auto         step   = mrpt::poses::Lie::SE<3>::log(after->pose - before.pose);
+            step *= alpha;
+            inOdom = before.pose + mrpt::poses::Lie::SE<3>::exp(step);
+        }
+    }
+    return itFrame->second.mean + inOdom;
+}
+
 void FastPredictor::clear()
 {
     std::lock_guard<std::mutex> lck(mtx_);
     snapshot_.reset();
     lastObsStamp_.reset();
+    rawOdometry_.clear();
 }
 
 std::optional<NavState> FastPredictor::predict(
@@ -135,6 +240,13 @@ std::optional<NavState> FastPredictor::predict(
             mrpt::poses::CPose3DPDFGaussian anchorPose;
             anchorPose.copyFrom(ret.pose);
             auto mapPdf = extrapolate_pose_pdf(params, anchorPose, ret.twist, anchorTwistCov, dt);
+            // The uncertainty stays the extrapolated anchor's; where wheel
+            // odometry is fused, the pose itself follows it (see the class docs).
+            if (const auto followed = pose_through_odometry(*snap, params, t_query, ret.twist);
+                followed)
+            {
+                mapPdf.mean = *followed;
+            }
             apply_pose_sigma_floor(params, mapPdf);
             ret.pose.copyFrom(mapPdf);
             return ret;

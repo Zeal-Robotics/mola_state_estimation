@@ -592,7 +592,15 @@ void StateEstimationSmoother::spinOnce()
     if (params_.async_backend)
     {
         // Lock-free: the fast predictor tracks the freshest observation stamp.
-        tNowOpt = fastPredictor_->get_current_extrapolated_stamp();
+        tNowOpt = fastPredictor_->get_timely_stamp(params_);
+        // The same reading as last time: nothing new to say. Only equality
+        // counts. After a pause in the inputs the stamp steps back, from a "now"
+        // that ran ahead on the wall clock to the reading that ended the pause.
+        if (tNowOpt && lastTimelyStamp_ && *lastTimelyStamp_ == *tNowOpt)
+        {
+            return;
+        }
+        lastTimelyStamp_ = tNowOpt;
     }
     else
     {
@@ -871,6 +879,8 @@ void StateEstimationSmoother::fuse_odometry(
     if (params_.async_backend)
     {
         fastPredictor_->note_observation_stamp(odom.timestamp);
+        fastPredictor_->note_raw_odometry(
+            odomName, odom.timestamp, mrpt::poses::CPose3D(odom.odometry));
         const auto odomCopy = odom;
         enqueue_async(
             odom.timestamp,
