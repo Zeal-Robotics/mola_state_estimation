@@ -394,7 +394,8 @@ void StateEstimationSimple::fuse_odometry_locked(
 
         state_.pose_already_updated_with_odom = true;
     }
-    state_.last_odom_obs = odom;
+    state_.last_odom_obs         = odom;
+    state_.last_odom_reading_tim = odom.timestamp;
 
     // Use wheel velocities when available: they give a correct, uncontaminated
     // twist for de-skewing and sigma computation, independently of whether
@@ -1184,12 +1185,20 @@ void StateEstimationSimple::fuse_pose(
     // The next odometry increment is added to this pose, so it has to start
     // at this pose's time. The baseline is the last reading at or before it:
     // the motion from that reading to now is already in the pose, and would
-    // be counted twice. Carry the baseline forward with the wheels' velocity.
+    // be counted twice. Carry the baseline forward with the wheels' velocity,
+    // but only while that velocity is recent: across an odometry stall it would
+    // carry the baseline on at a speed the vehicle no longer has. A stale
+    // baseline is dropped instead, and the next reading starts a new one.
     if (state_.last_odom_obs && state_.last_odom_obs->hasVelocities)
     {
         auto&        base = *state_.last_odom_obs;
         const double dt   = mrpt::system::timeDifference(base.timestamp, timestamp);
-        if (dt > 0)
+        const double age  = mrpt::system::timeDifference(*state_.last_odom_reading_tim, timestamp);
+        if (age > params.max_time_to_use_velocity_model)
+        {
+            state_.last_odom_obs.reset();
+        }
+        else if (dt > 0)
         {
             const auto& v = base.velocityLocal;
             base.odometry = base.odometry + mrpt::poses::CPose2D(v.vx * dt, v.vy * dt, v.omega * dt);
