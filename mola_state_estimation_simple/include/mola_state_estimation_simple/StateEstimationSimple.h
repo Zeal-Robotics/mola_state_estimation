@@ -168,8 +168,9 @@ class StateEstimationSimple : public mola::NavStateFilter
         State() = default;
 
         std::optional<mrpt::obs::CObservationOdometry> last_odom_obs;
-        // When last_odom_obs was received: fuse_pose() moves its stamp forward.
-        std::optional<mrpt::Clock::time_point>         last_odom_reading_tim;
+        // Time of the last pose fused, until an odometry reading after it has been
+        // measured from it: the next odometry increment starts here.
+        std::optional<mrpt::Clock::time_point>         odom_rebase_tim;
         std::optional<mrpt::Clock::time_point>         last_pose_obs_tim;
         std::optional<mrpt::poses::CPose3DPDFGaussian> last_pose;
         std::optional<mrpt::math::TTwist3D>            last_twist;

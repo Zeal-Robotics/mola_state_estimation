@@ -280,6 +280,113 @@ void test_odometry_stall_does_not_carry_a_stale_speed()
 }
 
 // --------------------------------------------------------------------------
+// Test 2a'': A short odometry stall does not carry the baseline at a stale speed
+// --------------------------------------------------------------------------
+// As Test 2a', with the odometry back after 0.5 s, inside the velocity model's
+// window: the first reading after the stall still moves the pose only by what
+// the vehicle did after the last pose.
+void test_short_odometry_stall_does_not_carry_a_stale_speed()
+{
+    std::cout << "[Test 2a''] Short odometry stall while braking... ";
+
+    auto cfg                                        = get_default_config();
+    cfg["params"]["max_time_to_use_velocity_model"] = 0.75;
+    mola::state_estimation_simple::StateEstimationSimple estimator;
+    estimator.initialize(cfg);
+
+    const auto fix = [&](double t, double x)
+    {
+        estimator.fuse_pose(
+            mrpt::Clock::fromDouble(t),
+            mrpt::poses::CPose3DPDFGaussian(
+                mrpt::poses::CPose3D(x, 0, 0, 0, 0, 0), mrpt::math::CMatrixDouble66::Identity()),
+            "map");
+    };
+    const auto odom = [&](double t, double x, double vx)
+    {
+        mrpt::obs::CObservationOdometry o;
+        o.timestamp           = mrpt::Clock::fromDouble(t);
+        o.odometry            = mrpt::poses::CPose2D(x, 0, 0);
+        o.hasVelocities       = true;
+        o.velocityLocal.vx    = vx;
+        o.velocityLocal.omega = 0.0;
+        estimator.onNewObservation(std::make_shared<const mrpt::obs::CObservationOdometry>(o));
+    };
+
+    // 1 m/s up to 1.0 s, then the odometry stops and the vehicle stops at 1.1 m.
+    fix(0.0, 0.0);
+    for (int k = 0; k <= 25; k++)
+    {
+        odom(0.04 * k, 0.04 * k, 1.0);
+    }
+    for (int k = 1; k <= 5; k++)
+    {
+        fix(1.0 + 0.1 * k, 1.1);
+    }
+
+    odom(1.52, 1.1, 0.0);
+    const auto after = estimator.estimated_navstate(mrpt::Clock::fromDouble(1.53), "map");
+    ASSERT_(after.has_value());
+    ASSERT_NEAR_(after->pose.mean.x(), 1.1, 0.02);
+
+    std::cout << "OK\n";
+}
+
+// --------------------------------------------------------------------------
+// Test 2a''': Odometry delivered late is not counted twice
+// --------------------------------------------------------------------------
+// The wheels keep measuring 1 m/s, but their readings for 1.2 s reach the
+// estimator only after the LiDAR poses for that time. Those poses already hold
+// that motion, so the late readings must not add it again.
+void test_late_odometry_is_not_counted_twice()
+{
+    std::cout << "[Test 2a'''] Odometry delivered late... ";
+
+    auto cfg                                        = get_default_config();
+    cfg["params"]["max_time_to_use_velocity_model"] = 0.75;
+    mola::state_estimation_simple::StateEstimationSimple estimator;
+    estimator.initialize(cfg);
+
+    const auto fix = [&](double t)
+    {
+        estimator.fuse_pose(
+            mrpt::Clock::fromDouble(t),
+            mrpt::poses::CPose3DPDFGaussian(
+                mrpt::poses::CPose3D(t, 0, 0, 0, 0, 0), mrpt::math::CMatrixDouble66::Identity()),
+            "map");
+    };
+    const auto odom = [&](double t)
+    {
+        mrpt::obs::CObservationOdometry o;
+        o.timestamp           = mrpt::Clock::fromDouble(t);
+        o.odometry            = mrpt::poses::CPose2D(t, 0, 0);
+        o.hasVelocities       = true;
+        o.velocityLocal.vx    = 1.0;
+        o.velocityLocal.omega = 0.0;
+        estimator.onNewObservation(std::make_shared<const mrpt::obs::CObservationOdometry>(o));
+    };
+
+    fix(0.0);
+    for (int k = 0; k <= 25; k++)
+    {
+        odom(0.04 * k);
+    }
+    for (int k = 1; k <= 12; k++)
+    {
+        fix(1.0 + 0.1 * k);
+    }
+    for (int k = 26; k <= 56; k++)
+    {
+        odom(0.04 * k);
+    }
+    const auto after = estimator.estimated_navstate(mrpt::Clock::fromDouble(2.24), "map");
+    ASSERT_(after.has_value());
+    ASSERT_NEAR_(after->pose.mean.x(), 2.24, 0.02);
+
+    std::cout << "OK\n";
+}
+
+// --------------------------------------------------------------------------
 // Test 2b: Pre-anchor odometry is discarded, not carried across fuse_pose()
 // --------------------------------------------------------------------------
 // Odometry can start streaming before the first LiDAR pose is ever fused
@@ -1975,6 +2082,8 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         test_odometry_fusion();
         test_prediction_runs_past_the_last_odometry_reading();
         test_odometry_stall_does_not_carry_a_stale_speed();
+        test_short_odometry_stall_does_not_carry_a_stale_speed();
+        test_late_odometry_is_not_counted_twice();
         test_pre_anchor_odometry_discarded();
         test_imu_angular_velocity();
         test_planar_motion();

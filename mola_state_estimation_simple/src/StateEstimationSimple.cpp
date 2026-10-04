@@ -29,6 +29,7 @@
 #include <mrpt/topography/conversions.h>
 
 #include <Eigen/Dense>
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <memory>
@@ -369,6 +370,12 @@ void StateEstimationSimple::fuse_odometry_locked(
 {
     fuse_pending_imu_up_to(odom.timestamp);
 
+    // The pose fused last already holds the motion up to its own time, so a reading at or before
+    // that time only moves the baseline, however late it arrives. The first reading after it is
+    // measured from the odometry interpolated at that time, between it and the reading before.
+    const bool coveredByPose =
+        state_.odom_rebase_tim.has_value() && odom.timestamp <= *state_.odom_rebase_tim;
+
     // Advance last_pose by the incremental 2D odometry delta.
     //
     // The increment is a HORIZONTAL (x, y, yaw) displacement: CObservationOdometry
@@ -379,9 +386,23 @@ void StateEstimationSimple::fuse_odometry_locked(
     // happened (on a 25 deg slope, ~42 % of every step becomes spurious z).
     // Apply it in the yaw-only frame instead, and leave z, pitch and roll to
     // the sources that actually observe them.
-    if (state_.last_odom_obs && state_.last_pose)
+    if (state_.last_odom_obs && state_.last_pose && !coveredByPose)
     {
-        const auto poseIncr = odom.odometry - state_.last_odom_obs->odometry;
+        auto base = state_.last_odom_obs->odometry;
+        if (state_.odom_rebase_tim)
+        {
+            const auto&  prev = *state_.last_odom_obs;
+            const double span = mrpt::system::timeDifference(prev.timestamp, odom.timestamp);
+            const double frac =
+                span > 0 ? std::clamp(
+                               mrpt::system::timeDifference(prev.timestamp, *state_.odom_rebase_tim) /
+                                   span,
+                               0.0, 1.0)
+                         : 0.0;
+            const auto d = odom.odometry - base;
+            base         = base + mrpt::poses::CPose2D(frac * d.x(), frac * d.y(), frac * d.phi());
+        }
+        const auto poseIncr = odom.odometry - base;
 
         auto&        p   = state_.last_pose->mean;
         const double yaw = p.yaw();
@@ -394,8 +415,11 @@ void StateEstimationSimple::fuse_odometry_locked(
 
         state_.pose_already_updated_with_odom = true;
     }
-    state_.last_odom_obs         = odom;
-    state_.last_odom_reading_tim = odom.timestamp;
+    if (!coveredByPose)
+    {
+        state_.odom_rebase_tim.reset();
+    }
+    state_.last_odom_obs = odom;
 
     // Use wheel velocities when available: they give a correct, uncontaminated
     // twist for de-skewing and sigma computation, independently of whether
@@ -1182,29 +1206,15 @@ void StateEstimationSimple::fuse_pose(
     state_.last_pose_obs_tim              = timestamp;
     state_.pose_already_updated_with_odom = false;
 
-    // The next odometry increment is added to this pose, so it has to start
-    // at this pose's time. The baseline is the last reading at or before it:
-    // the motion from that reading to now is already in the pose, and would
-    // be counted twice. Carry the baseline forward with the wheels' velocity,
-    // but only while that velocity is recent: across an odometry stall it would
-    // carry the baseline on at a speed the vehicle no longer has. A stale
-    // baseline is dropped instead, and the next reading starts a new one.
-    if (state_.last_odom_obs && state_.last_odom_obs->hasVelocities)
-    {
-        auto&        base = *state_.last_odom_obs;
-        const double dt   = mrpt::system::timeDifference(base.timestamp, timestamp);
-        const double age  = mrpt::system::timeDifference(*state_.last_odom_reading_tim, timestamp);
-        if (age > params.max_time_to_use_velocity_model)
-        {
-            state_.last_odom_obs.reset();
-        }
-        else if (dt > 0)
-        {
-            const auto& v = base.velocityLocal;
-            base.odometry = base.odometry + mrpt::poses::CPose2D(v.vx * dt, v.vy * dt, v.omega * dt);
-            base.timestamp = timestamp;
-        }
-    }
+    // The next odometry increment is added to this pose, so it has to start at this pose's time:
+    // the motion up to it is already in the pose, and would be counted twice. The odometry at this
+    // time is taken from the readings on either side of it (see fuse_odometry_locked()), never
+    // extrapolated: a speed carried past the last reading is wrong across a stall, and a reading
+    // that is only late has not been lost. Odometry without velocities stays anchored to its last
+    // reading, as test_odometry_fusion() pins.
+    const bool anchored = state_.last_odom_obs && !state_.last_odom_obs->hasVelocities;
+    state_.odom_rebase_tim =
+        anchored ? std::nullopt : std::optional<mrpt::Clock::time_point>(timestamp);
 }
 
 namespace
