@@ -891,6 +891,33 @@ void StateEstimationSmoother::fuse_odometry(
     fuse_odometry_locked(odom, odomName);
 }
 
+namespace
+{
+/// The wheel odometry at time t, interpolated between the readings on either
+/// side of it; empty if t lies outside the readings.
+std::optional<mrpt::poses::CPose2D> interpolate_wheels_odometry(
+    const std::deque<std::pair<mrpt::Clock::time_point, mrpt::poses::CPose2D>>& readings,
+    const mrpt::Clock::time_point&                                              t)
+{
+    if (readings.empty() || t < readings.front().first || t > readings.back().first)
+    {
+        return {};
+    }
+    auto after = std::lower_bound(
+        readings.begin(), readings.end(), t,
+        [](const auto& r, const mrpt::Clock::time_point& tt) { return r.first < tt; });
+    if (after->first == t || after == readings.begin())
+    {
+        return after->second;
+    }
+    const auto&  before = *std::prev(after);
+    const double span   = mrpt::system::timeDifference(before.first, after->first);
+    const double frac   = span > 0 ? mrpt::system::timeDifference(before.first, t) / span : 0.0;
+    const auto   d      = after->second - before.second;
+    return before.second + mrpt::poses::CPose2D(frac * d.x(), frac * d.y(), frac * d.phi());
+}
+}  // namespace
+
 void StateEstimationSmoother::fuse_odometry_locked(
     const mrpt::obs::CObservationOdometry& odom, const std::string& odomName)
 {
@@ -898,6 +925,19 @@ void StateEstimationSmoother::fuse_odometry_locked(
     //  This is a convenience method that internally ends up calling
     //  fuse_pose(), but computing the uncertainty of odometry increments
     //  according to a given motion model.
+
+    // Every reading, decimated or not, for interpolating the odometry at a
+    // keyframe's own time (see the map->odom of wheel odometry below):
+    auto& recent = state_.recent_wheels_odometry;
+    if (recent.empty() || recent.back().first < odom.timestamp)
+    {
+        recent.emplace_back(odom.timestamp, odom.odometry);
+    }
+    while (recent.size() > 2 && mrpt::system::timeDifference(recent.front().first, odom.timestamp) >
+                                    params_.sliding_window_length)
+    {
+        recent.pop_front();
+    }
 
     mrpt::poses::CPose2D lastOdom;
     if (state_.last_wheels_odometry_name.has_value())
@@ -1465,6 +1505,17 @@ void StateEstimationSmoother::fuse_pose_locked(
     {
         // ref is "map":
         mark_map_observed_locked();
+        auto& priors = state_.map_prior_keyframes;
+        if (priors.empty() || priors.back().second < timestamp)
+        {
+            priors.emplace_back(this_kf_id, timestamp);
+            while (priors.size() > 2 &&
+                   mrpt::system::timeDifference(priors.front().second, timestamp) >
+                       params_.sliding_window_length)
+            {
+                priors.pop_front();
+            }
+        }
         state_.gtsam->newFactors.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
             T(this_kf_id), pose_out,
             with_huber(
@@ -2951,6 +3002,24 @@ void StateEstimationSmoother::process_pending_gtsam_updates_locked()
                 if (itName != state_.known_odom_frames.getDirectMap().end() &&
                     itName->second == idx)
                 {
+                    // Wheel odometry: taken at the newest keyframe a {map} pose
+                    // pins, with the odometry interpolated at that keyframe's
+                    // time. The keyframes of the odometry chain itself are tied to
+                    // those priors only through the motion model, and after a
+                    // fast turn they can sit a degree or more off them for
+                    // seconds, which the chain's tail would pass on to every pose
+                    // in {map}.
+                    const auto& priors = state_.map_prior_keyframes;
+                    for (auto it = priors.rbegin(); it != priors.rend(); ++it)
+                    {
+                        const auto itKf = state_.last_estimated_states.find(it->first);
+                        const auto odomAt =
+                            interpolate_wheels_odometry(state_.recent_wheels_odometry, it->second);
+                        if (itKf != state_.last_estimated_states.end() && odomAt)
+                        {
+                            return itKf->second.pose + (-mrpt::poses::CPose3D(*odomAt));
+                        }
+                    }
                     tailKf         = state_.last_wheels_odometry_kf;
                     tailPoseInOdom = mrpt::poses::CPose3D(*state_.last_wheels_odometry_at_kf);
                 }

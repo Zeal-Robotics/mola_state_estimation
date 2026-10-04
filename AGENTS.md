@@ -127,8 +127,11 @@ Other behavior:
   body-twist increment, falling back to the `{map}` conversion before the
   source's first reading.
 - Estimated `T_map_to_odom_i` of a relative source is computed as
-  `X(chain tail kf) (+) pose_in_odom(tail)^-1`; for other sources it is the
-  graph variable.
+  `X(kf) (+) pose_in_odom(kf)^-1`. For wheel odometry `kf` is the newest
+  solved keyframe with a `{map}` pose prior, with the odometry interpolated at
+  its stamp from the readings of the last window; otherwise, and for other
+  relative sources, it is the chain tail. Absolute sources use the graph
+  variable.
 - Extrapolation (`extrapolate_pose_pdf()`) propagates covariance: anchor
   covariance through the composition plus velocity and acceleration noise.
 - Predict-twist low-pass (`predict_twist_filter_enabled`,

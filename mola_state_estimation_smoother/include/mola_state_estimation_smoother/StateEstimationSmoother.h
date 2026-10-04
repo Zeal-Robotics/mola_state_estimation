@@ -406,6 +406,14 @@ class StateEstimationSmoother : public mola::NavStateFilter,
         /// later readings on the same keyframe lose no motion.
         std::optional<mrpt::poses::CPose2D> last_wheels_odometry_at_kf;
 
+        /// Wheel odometry readings of the last sliding window, at their own
+        /// stamps and before decimation. Reset with the estimator.
+        std::deque<std::pair<mrpt::Clock::time_point, mrpt::poses::CPose2D>> recent_wheels_odometry;
+
+        /// Keyframes carrying a {map} pose prior with that prior's stamp,
+        /// newest last. Reset with the estimator.
+        std::deque<std::pair<frame_index_t, mrpt::Clock::time_point>> map_prior_keyframes;
+
         /// Keyframe carrying the single absolute pose-in-{odom_i} factor that
         /// resolves T_map_to_odom_i for wheel odometry. Set once
         /// and never renewed: the fixed-lag smoother marginalizes keyframes
