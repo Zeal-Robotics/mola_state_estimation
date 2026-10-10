@@ -393,6 +393,8 @@ void StateEstimationSimple::fuse_odometry_locked(
         {
             const auto&  prev = *state_.last_odom_obs;
             const double span = mrpt::system::timeDifference(prev.timestamp, odom.timestamp);
+            // How far between the two readings the pose falls. A reading before the pose that is
+            // stamped after it clamps to 0, which no current caller produces.
             const double frac =
                 span > 0 ? std::clamp(
                                mrpt::system::timeDifference(prev.timestamp, *state_.odom_rebase_tim) /
