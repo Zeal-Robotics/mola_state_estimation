@@ -468,6 +468,174 @@ void test_pre_anchor_odometry_discarded()
 }
 
 // --------------------------------------------------------------------------
+// Test 2c: A turning increment is applied along the heading, in the yaw-only frame
+// --------------------------------------------------------------------------
+// Wheel odometry reports (x, y, yaw) in its own frame. The increment between two
+// readings is motion in the vehicle's frame, so it moves the pose along the
+// pose's heading in {map} and turns it by the odometry's yaw change. Being
+// horizontal, it leaves z, pitch and roll to the sources that observe them.
+void test_turning_odometry_follows_the_heading()
+{
+    std::cout << "[Test 2c] Turning odometry follows the heading... ";
+
+    mola::state_estimation_simple::StateEstimationSimple estimator;
+    estimator.initialize(get_default_config());
+
+    // Facing +y in {map}, on a 0.2 rad slope:
+    const double yaw0 = M_PI / 2, pitch0 = 0.2;
+    estimator.fuse_pose(
+        mrpt::Clock::fromDouble(0.0),
+        mrpt::poses::CPose3DPDFGaussian(
+            mrpt::poses::CPose3D(2.0, 1.0, 0.0, yaw0, pitch0, 0.0),
+            mrpt::math::CMatrixDouble66::Identity()),
+        "map");
+
+    // 1.0 m ahead, 0.2 m to the left and 0.4 rad of turn in the vehicle's frame,
+    // from an odometry frame that is not {map}:
+    const auto odomStart = mrpt::poses::CPose2D(5.0, -3.0, 0.3);
+    const auto motion    = mrpt::poses::CPose2D(1.0, 0.2, 0.4);
+    const auto odom      = [&](double t, const mrpt::poses::CPose2D& p)
+    {
+        mrpt::obs::CObservationOdometry o;
+        o.timestamp           = mrpt::Clock::fromDouble(t);
+        o.odometry            = p;
+        o.hasVelocities       = true;
+        o.velocityLocal.vx    = 2.0;
+        o.velocityLocal.vy    = 0.4;
+        o.velocityLocal.omega = 0.8;
+        estimator.onNewObservation(std::make_shared<const mrpt::obs::CObservationOdometry>(o));
+    };
+    odom(0.0, odomStart);
+    odom(0.5, odomStart + motion);
+
+    const auto s = estimator.estimated_navstate(mrpt::Clock::fromDouble(0.5), "map");
+    ASSERT_(s.has_value());
+    const auto& p = s->pose.mean;
+    ASSERT_NEAR_(p.x(), 2.0 - 0.2, 1e-6);
+    ASSERT_NEAR_(p.y(), 1.0 + 1.0, 1e-6);
+    ASSERT_NEAR_(p.z(), 0.0, 1e-6);
+    ASSERT_NEAR_(p.yaw(), yaw0 + 0.4, 1e-6);
+    ASSERT_NEAR_(p.pitch(), pitch0, 1e-6);
+    ASSERT_NEAR_(p.roll(), 0.0, 1e-6);
+
+    std::cout << "OK\n";
+}
+
+// --------------------------------------------------------------------------
+// Test 2d: A pose fused between two readings of a turn is not turned twice
+// --------------------------------------------------------------------------
+// As Test 2a, for the heading: a vehicle turning in place, with a LiDAR pose
+// that falls between two wheel readings. The turn up to the pose is already in
+// it, so the next reading adds only the turn after the pose.
+void test_pose_between_readings_of_a_turn_is_not_turned_twice()
+{
+    std::cout << "[Test 2d] Pose fused between readings of a turn... ";
+
+    mola::state_estimation_simple::StateEstimationSimple estimator;
+    estimator.initialize(get_default_config());
+
+    // 25 Hz wheel odometry of a vehicle turning in place at 1 rad/s:
+    constexpr double OMEGA  = 1.0;  // [rad/s]
+    constexpr double PERIOD = 0.04;  // [s]
+    const auto       odom   = [&](int k)
+    {
+        const double                    t = PERIOD * k;
+        mrpt::obs::CObservationOdometry o;
+        o.timestamp           = mrpt::Clock::fromDouble(t);
+        o.odometry            = mrpt::poses::CPose2D(0, 0, OMEGA * t);
+        o.hasVelocities       = true;
+        o.velocityLocal.omega = OMEGA;
+        estimator.onNewObservation(std::make_shared<const mrpt::obs::CObservationOdometry>(o));
+    };
+    const auto fix = [&](double t)
+    {
+        estimator.fuse_pose(
+            mrpt::Clock::fromDouble(t),
+            mrpt::poses::CPose3DPDFGaussian(
+                mrpt::poses::CPose3D(0, 0, 0, OMEGA * t, 0, 0),
+                mrpt::math::CMatrixDouble66::Identity()),
+            "map");
+    };
+
+    fix(0.0);
+    for (int k = 0; k <= 10; k++)
+    {
+        odom(k);
+    }
+    fix(0.42);  // halfway between the readings at 0.40 and 0.44 s
+    odom(11);
+    odom(12);
+
+    const auto s = estimator.estimated_navstate(mrpt::Clock::fromDouble(0.48), "map");
+    ASSERT_(s.has_value());
+    ASSERT_NEAR_(s->pose.mean.yaw(), OMEGA * 0.48, 1e-4);
+
+    std::cout << "OK\n";
+}
+
+// --------------------------------------------------------------------------
+// Test 2e: Odometry moves the pose, but its uncertainty grows from the last pose fused
+// --------------------------------------------------------------------------
+// The wheels keep the pose current between LiDAR poses, yet they drift, so the
+// returned covariance grows with the time since the last fuse_pose() as the
+// class docs state, however recent the last odometry reading is.
+void test_odometry_does_not_reset_the_uncertainty()
+{
+    std::cout << "[Test 2e] Uncertainty grows from the last pose fused... ";
+
+    const auto                                           cfg = get_default_config();
+    const auto&                                          prm = cfg["params"];
+    mola::state_estimation_simple::StateEstimationSimple estimator;
+    estimator.initialize(cfg);
+
+    const double var0 = 1e-4;
+    auto         cov0 = mrpt::math::CMatrixDouble66::Zero();
+    for (int i = 0; i < 6; i++)
+    {
+        cov0(i, i) = var0;
+    }
+    estimator.fuse_pose(
+        mrpt::Clock::fromDouble(0.0),
+        mrpt::poses::CPose3DPDFGaussian(mrpt::poses::CPose3D::Identity(), cov0), "map");
+
+    // 1 m/s straight ahead at 25 Hz, up to the queried time:
+    constexpr double T = 0.8;  // [s]
+    for (int k = 0; k <= 20; k++)
+    {
+        const double                    t = 0.04 * k;
+        mrpt::obs::CObservationOdometry o;
+        o.timestamp        = mrpt::Clock::fromDouble(t);
+        o.odometry         = mrpt::poses::CPose2D(t, 0, 0);
+        o.hasVelocities    = true;
+        o.velocityLocal.vx = 1.0;
+        estimator.onNewObservation(std::make_shared<const mrpt::obs::CObservationOdometry>(o));
+    }
+
+    const auto s = estimator.estimated_navstate(mrpt::Clock::fromDouble(T), "map");
+    ASSERT_(s.has_value());
+    ASSERT_NEAR_(s->pose.mean.x(), T, 1e-6);
+
+    const double varXYZ =
+        var0 + mrpt::square(prm["sigma_relative_pose_linear"].as<double>()) +
+        mrpt::square(T * prm["sigma_random_walk_acceleration_linear"].as<double>());
+    const double varRot =
+        var0 + mrpt::square(prm["sigma_relative_pose_angular"].as<double>()) +
+        mrpt::square(T * prm["sigma_random_walk_acceleration_angular"].as<double>());
+    // Every term is diagonal, so each variance is the inverse of its information:
+    const auto& info = s->pose.cov_inv;
+    for (int i = 0; i < 3; i++)
+    {
+        ASSERT_NEAR_(1.0 / info(i, i), varXYZ, 1e-9);
+    }
+    for (int i = 3; i < 6; i++)
+    {
+        ASSERT_NEAR_(1.0 / info(i, i), varRot, 1e-9);
+    }
+
+    std::cout << "OK\n";
+}
+
+// --------------------------------------------------------------------------
 // Test 3: IMU Fusion (Angular Velocity)
 // --------------------------------------------------------------------------
 // The simple estimator uses IMU to overwrite the angular velocity (twist)
@@ -2085,6 +2253,9 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
         test_short_odometry_stall_does_not_carry_a_stale_speed();
         test_late_odometry_is_not_counted_twice();
         test_pre_anchor_odometry_discarded();
+        test_turning_odometry_follows_the_heading();
+        test_pose_between_readings_of_a_turn_is_not_turned_twice();
+        test_odometry_does_not_reset_the_uncertainty();
         test_imu_angular_velocity();
         test_planar_motion();
         test_gnss_ignored();
