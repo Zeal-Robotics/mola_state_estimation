@@ -1213,7 +1213,7 @@ void StateEstimationSimple::fuse_pose(
     // time is taken from the readings on either side of it (see fuse_odometry_locked()), never
     // extrapolated: a speed carried past the last reading is wrong across a stall, and a reading
     // that is only late has not been lost. Odometry without velocities stays anchored to its last
-    // reading, as test_odometry_fusion() pins.
+    // reading.
     const bool anchored = state_.last_odom_obs && !state_.last_odom_obs->hasVelocities;
     state_.odom_rebase_tim =
         anchored ? std::nullopt : std::optional<mrpt::Clock::time_point>(timestamp);
